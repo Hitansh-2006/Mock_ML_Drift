@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef, Fragment } from "react";
 import { api, API_URL, getAdminKey, setAdminKey } from "./api";
 import { useTheme } from "./useTheme";
+import { AutomationCard } from "./components/AutomationCard";
 
 const POLL_MS = 5000;
 let toastIdCounter = 0;
@@ -687,6 +688,8 @@ export default function App() {
   const [predictions, setPredictions] = useState([]);
   const [driftEvents, setDriftEvents] = useState([]);
   const [promotionRequests, setPromotionRequests] = useState([]);
+  const [automation, setAutomation] = useState(null);
+  const [automationBusy, setAutomationBusy] = useState(null);
   const [error, setError] = useState(null);
   const [busyId, setBusyId] = useState(null);
   const [toasts, setToasts] = useState([]);
@@ -707,18 +710,20 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [s, st, p, d, r] = await Promise.all([
+      const [s, st, p, d, r, a] = await Promise.all([
         api.getStatus(),
         api.getStats(),
         api.getPredictions(50),
         api.getDriftEvents(20),
         api.getPromotionRequests(),
+        api.getAutomation(),
       ]);
       setStatus(s);
       setStats(st);
       setPredictions(p);
       setDriftEvents(d);
       setPromotionRequests(r);
+      setAutomation(a);
       setError(null);
       setNeedsKey(false);
     } catch (e) {
@@ -844,6 +849,27 @@ export default function App() {
     }
   };
 
+  const runAutomation = async (kind, call, okMessage) => {
+    setAutomationBusy(kind);
+    try {
+      await call();
+      addToast(okMessage, "success");
+      await refresh();
+    } catch (e) {
+      reportError("Automation", e);
+    } finally {
+      setAutomationBusy(null);
+    }
+  };
+  const handleAutomationStart = (seconds) =>
+    runAutomation("start", () => api.startAutomation(seconds), "Automation started. It never promotes anything on its own.");
+  const handleAutomationStop = () => runAutomation("stop", () => api.stopAutomation(), "Automation stopped.");
+  const handleAutomationRunNow = () =>
+    runAutomation("run", () => api.runAutomationNow(), "Cycle started — the result appears here when it finishes.");
+
+  // "ok" | "locked" (admin key missing/wrong) | "offline" (API unreachable)
+  const automationState = needsKey ? "locked" : automation ? "ok" : "offline";
+
   const latestDrift = driftEvents.length > 0 ? driftEvents[0] : null;
   const pendingPromotion =
     promotionRequests.find((r) => r.status === "pending") || null;
@@ -882,6 +908,14 @@ export default function App() {
         loading={actionLoading}
         baselineReady={!!status?.baseline_ready}
         shadowVersion={status?.shadow_version}
+      />
+      <AutomationCard
+        automation={automation}
+        state={automationState}
+        busy={automationBusy}
+        onStart={handleAutomationStart}
+        onStop={handleAutomationStop}
+        onRunNow={handleAutomationRunNow}
       />
       <PromotionRequests
         requests={promotionRequests}

@@ -1026,3 +1026,36 @@ tbody tr:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
+
+/* --- Automation card ----------------------------- */
+.automation-card {
+  background: var(--surface);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  padding: 22px 24px;
+  box-shadow: var(--shadow-xs);
+}
+.automation-head { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.automation-head h2 { margin: 0 0 6px; }
+.status-pill {
+  display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px;
+  border-radius: 999px; font-size: 13px; font-weight: 600; border: 1px solid var(--border);
+  background: var(--surface-hover); color: var(--text-secondary);
+}
+.status-pill .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+.status-pill.running { background: var(--success-bg); border-color: var(--success-border); color: var(--success); }
+.status-pill.running .status-dot { background: var(--success); }
+.status-pill.offline { color: var(--text-muted); }
+.automation-facts { display: grid; grid-template-columns: 1fr 1fr 2fr; gap: 16px; margin: 4px 0 18px; }
+.automation-facts dt { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
+.automation-facts dd { margin: 2px 0 0; font-size: 15px; font-weight: 500; }
+.automation-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.automation-interval { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-muted); }
+.automation-interval select {
+  height: 44px; padding: 0 10px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); font: inherit;
+}
+.automation-note { margin: 14px 0 0; font-size: 13px; color: var(--text-muted); }
+.text-danger { color: var(--danger); }
+.muted { color: var(--text-muted); font-weight: 400; }
+@media (max-width: 640px) { .automation-facts { grid-template-columns: 1fr; } }

@@ -1,6 +1,5 @@
-# Brings up the whole pipeline: Postgres, the serving API, the automation
-# loop (drift monitor + retrain + evaluation gate on a schedule), and the
-# dashboard. Run with:
+# Brings up Postgres, the serving API (which hosts the automation loop - start it
+# from the dashboard) and the dashboard. Run with:
 #     docker compose up --build
 #
 # NOTE: this file has been written carefully but NOT run in a live Docker
@@ -31,12 +30,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: uvicorn serving.app:app --host 0.0.0.0 --port 8000
+    # ONE worker on purpose: the model cache and the automation scheduler live in the process.
+    command: uvicorn serving.app:app --host 0.0.0.0 --port 8000 --workers 1
     environment:
       DRIFT_WATCHDOG_DB_URL: postgresql://driftwatchdog:driftwatchdog@postgres:5432/driftwatchdog
       # Compose refuses to start if this isn't set in .env (see .env.example)
       ADMIN_API_KEY: ${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env - see .env.example}
       DASHBOARD_ORIGINS: ${DASHBOARD_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      # Used by the in-process automation loop (the dashboard's Automation card):
+      CHECK_INTERVAL_SECONDS: "${CHECK_INTERVAL_SECONDS:-60}"
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
     ports:
       - "8000:8000"
     volumes:
@@ -46,7 +49,12 @@ services:
       postgres:
         condition: service_healthy
 
+  # Headless fallback only. The default stack runs the automation loop INSIDE the
+  # serving process, switched on/off from the dashboard's Automation card, so a
+  # plain `docker compose up` must not start a second loop next to it. To use the
+  # separate loop instead:  docker compose --profile headless up --build
   automation:
+    profiles: ["headless"]
     build:
       context: .
       dockerfile: Dockerfile

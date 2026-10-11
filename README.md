@@ -53,7 +53,7 @@ flowchart LR
 | **Drift Monitor** | KS-test comparing recent live input features against the original training distribution; flags drift when 2+ features shift significantly | `monitor/drift_monitor.py` |
 | **Retrain Pipeline** | Trains a challenger on recent *labeled* live data (not the stale original set) and deploys it to shadow — visible in every prediction's logs, never served to a real caller | `retrain/retrain_pipeline.py` |
 | **Evaluation Gate** | Pairs production's and the challenger's predictions on the same real requests, runs a Wilcoxon signed-rank test on their errors, and only creates a promotion request if the improvement is real and statistically significant | `evaluation/evaluation_gate.py` |
-| **Automation Loop** | Runs the above three on a schedule, holding off retraining again while a challenger is already awaiting evaluation | `automation/loop.py` |
+| **Automation Loop** | Runs the above three on a schedule, holding off retraining again while a challenger is already awaiting evaluation. Runs inside the serving process and is started/stopped from the dashboard's **Automation** card (or headless, see below) | `automation/loop.py`, `automation/controller.py` |
 | **Dashboard** | Plain, flat React UI: model status, drift history, recent predictions, and the *only* place a human clicks approve/reject | `dashboard/` |
 
 ## Human approval — the one thing automation can never do
@@ -74,6 +74,62 @@ Two guards keep that claim true in practice:
 - The **Train Baseline** button only creates the *first* model (v1) and
   refuses to overwrite one that exists. Replacing what serves production
   always goes retrain → shadow → evaluation gate → human approval.
+
+## Restart safety: the DB decides what is production
+
+Which model is `production` and which (if any) is `shadow` is stored in the
+`model_registry` table (`version`, `role` = `production | shadow | archived |
+rejected`, `created_at`, `promoted_at`, plus optional `trained_on_rows` /
+`metrics` / `reference_path`). The in-memory `STATE` in `serving/app.py` is only
+a cache for the `/predict` hot path: every change writes the DB first, then the
+cache, and `startup()` rebuilds the cache from the table. So an approved
+promotion survives a restart. Partial unique indexes make "exactly one
+production, at most one shadow" a database guarantee.
+
+- **Approve** validates that the challenger is the current shadow (else `409
+  stale request`) and that its model + preprocessor *load* (else `500`, and
+  nothing in the DB changes); then, in one transaction, it marks the request
+  approved, archives the old production, makes the challenger production and
+  clears the shadow slot.
+- **Reject** marks the request and the challenger `rejected` and frees the shadow
+  slot, so *Retrain Challenger* works again.
+- **`set_shadow`** archives the previous shadow. A pending request for a
+  challenger that stopped being the shadow is marked `withdrawn`.
+- **Upgrading an older DB**: if `model_registry` is empty at startup it is seeded
+  with production = the challenger of the most recent *approved* promotion request
+  (otherwise `v1`), so an approval that already exists is never lost.
+
+The registry (and the automation state below) assume **one serving process / one
+uvicorn worker**; with several workers each would hold its own cache and scheduler.
+
+## Automation loop: start/stop from the dashboard
+
+The **Automation** card in the dashboard starts and stops the drift → retrain →
+gate loop. It runs inside the serving process (APScheduler `BackgroundScheduler`,
+one job, `max_instances=1`, `coalesce=True`) and calls the serving code directly
+rather than making HTTP requests to itself. It never promotes anything: a cycle
+that passes the gate only creates a `pending` promotion request.
+
+| Route (all need `X-API-Key`) | |
+|---|---|
+| `GET /admin/automation` | `{running, interval_seconds, next_run_at, last_cycle_at, last_cycle: {drift_checked, drift_triggered, action: none\|retrain\|gate, gate_result, error, message}, started_at, cycle_in_progress}` |
+| `POST /admin/automation/start` `{interval_seconds?}` | start (idempotent); a new interval reschedules a running loop; first cycle runs one interval later |
+| `POST /admin/automation/stop` | stop (idempotent); a cycle already running finishes |
+| `POST /admin/automation/run_now` | run one cycle now in the background (`409` if one is running) |
+
+- `enabled`, the interval and the last-cycle summary are stored in the
+  `automation_state` table; if the loop was on, it is switched back on at startup.
+- A cycle never crashes the scheduler: an exception is caught and shown as the
+  cycle's `error`.
+- The loop and the **Retrain** button share one lock (`RETRAIN_LOCK`). If a retrain is
+  already running, the cycle skips retraining and says so.
+- Retraining runs in a thread of the serving process, so `/predict` can be slower
+  while a challenger trains.
+- `CHECK_INTERVAL_SECONDS` is the default interval (60); the dashboard offers
+  15 s – 15 min, the API accepts 5 s – 24 h.
+- **Headless alternative**: `python -m automation.loop` (same cycle code, talks to a
+  running API over HTTP) or, in Docker, `docker compose --profile headless up`. Do not
+  run it *and* the dashboard loop at once: the in-process lock cannot see another process.
 
 ## Data
 
@@ -136,8 +192,10 @@ export ADMIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(3
 uvicorn serving.app:app --reload --port 8000          # terminal 1
 python simulator/stream_simulator.py --speed 0.02      # terminal 2
 ```
-Any other terminal that runs `python -m retrain.retrain_pipeline` or
+Start the loop from the dashboard's **Automation** card (no third terminal needed).
+Any other terminal that runs `python -m retrain.retrain_pipeline` or the headless
 `python -m automation.loop` needs the **same** `ADMIN_API_KEY` exported.
+Run exactly **one** uvicorn worker (the default; don't pass `--workers N`).
 
 ### With Postgres + full automation, via Docker Compose
 ```bash
@@ -145,8 +203,16 @@ cp .env.example .env        # then set ADMIN_API_KEY (and optionally GROQ_API_KE
 docker compose up --build
 ```
 Compose refuses to start until `ADMIN_API_KEY` is set in `.env`.
-This starts Postgres, the serving API, the automation loop (checking every
-60s by default), and the dashboard at `http://localhost:5173`.
+This starts Postgres, the serving API (one worker) and the dashboard at
+`http://localhost:5173`. Switch the automation loop on from the dashboard's
+Automation card; it checks every 60 s by default (`CHECK_INTERVAL_SECONDS`).
+
+The separate `automation` service is under the `headless` profile, so a plain
+`docker compose up` does not run a second loop next to the button. To run the loop
+as its own container instead (and leave the card off):
+```bash
+docker compose --profile headless up --build
+```
 
 > **Honest note on the Compose setup**: the Postgres connection, the
 > serving/retrain/monitor/gate code, and the automation loop have all been
@@ -189,8 +255,12 @@ the admin key (it will prompt for it).
 pip install -r requirements-dev.txt
 pytest
 ```
-The tests cover the admin-key protection, CORS, upload validation, the
-baseline-overwrite guard and the retrain locking.
+The tests cover the admin-key protection (every `/admin` route, read from the
+OpenAPI schema), CORS, upload validation, the baseline-overwrite guard, the retrain
+locking, the model registry (restart safety, atomic approve/reject, legacy-DB
+seeding) and the automation loop (start/stop, restore after restart, overlap and
+lock handling, and that a cycle can never promote). They use a temporary SQLite DB
+and a temporary models directory.
 
 ## What's genuinely tested vs. what to verify yourself
 

@@ -76,4 +76,11 @@ export const api = {
   trainBaseline: () => postEmpty("/admin/train_baseline"),
   runDriftCheck: () => postEmpty("/admin/run_drift_check"),
   retrain: () => postEmpty("/admin/retrain"),
+
+  // automation loop (Start/Stop card)
+  getAutomation: () => get("/admin/automation"),
+  startAutomation: (interval_seconds) =>
+    post("/admin/automation/start", interval_seconds ? { interval_seconds } : {}),
+  stopAutomation: () => postEmpty("/admin/automation/stop"),
+  runAutomationNow: () => postEmpty("/admin/automation/run_now"),
 };
