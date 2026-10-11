@@ -462,3 +462,10 @@ dialog.dialog::backdrop { background: var(--scrim); }
 @media (max-width: 400px) {
   .grid-kpi { grid-template-columns: 1fr; }
 }
+
+/* Very narrow panes: keep the logo, hide the name visually (it stays in the h1 for screen readers). */
+@media (max-width: 340px) {
+  .brand span {
+    position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+  }
+}
