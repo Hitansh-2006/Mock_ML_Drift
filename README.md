@@ -54,7 +54,7 @@ flowchart LR
 | **Retrain Pipeline** | Trains a challenger on recent *labeled* live data (not the stale original set) and deploys it to shadow — visible in every prediction's logs, never served to a real caller | `retrain/retrain_pipeline.py` |
 | **Evaluation Gate** | Pairs production's and the challenger's predictions on the same real requests, runs a Wilcoxon signed-rank test on their errors, and only creates a promotion request if the improvement is real and statistically significant | `evaluation/evaluation_gate.py` |
 | **Automation Loop** | Runs the above three on a schedule, holding off retraining again while a challenger is already awaiting evaluation. Runs inside the serving process and is started/stopped from the dashboard's **Automation** card (or headless, see below) | `automation/loop.py`, `automation/controller.py` |
-| **Dashboard** | Plain, flat React UI: model status, drift history, recent predictions, and the *only* place a human clicks approve/reject | `dashboard/` |
+| **Dashboard** | React UI: honest status (offline / waiting / normal / drift), the Automation start/stop card, drift history, recent predictions, and the *only* place a human clicks approve/reject (with a confirmation showing the evidence) | `dashboard/` |
 
 ## Human approval — the one thing automation can never do
 

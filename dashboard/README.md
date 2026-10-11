@@ -1,49 +1,55 @@
 # Drift-Watchdog Dashboard
 
-A plain, flat React dashboard for the drift-watchdog pipeline — status,
-pending promotion requests (with approve/reject), drift monitor history, and
-recent predictions. Light/dark theme toggle, no gradients, no shadows, no
-glossy card styling — intentionally plain.
+React + Vite single-page app for the drift-watchdog pipeline: an overview
+(KPIs, honest status, quick actions), the **Automation** start/stop card, the
+drift monitor, promotion requests (approve/reject with confirmation) and recent
+predictions. Light and dark themes. No UI or charting library: the two charts
+(drift-score sparkline, production-vs-challenger bar) are small inline SVGs.
 
-This talks directly to your local FastAPI backend at `http://localhost:8000`,
-so it needs that running to show anything real.
+It talks to the serving API at `VITE_API_URL` (default `http://localhost:8000`)
+and asks for the admin key the first time (kept in this browser's localStorage,
+never in the bundle).
 
 ## Run it
 
 ```bash
-# 1. In one terminal, from the project root — start the backend
-uvicorn serving.app:app --reload --port 8000
+# 1. project root: the backend (one worker)
+uvicorn serving.app:app --port 8000
 
-# 2. In another terminal — start the dashboard
+# 2. the dashboard
 cd dashboard
-npm install
-npm run dev
+npm ci
+npm run dev          # http://localhost:5173
+npm run lint         # oxlint, 0 errors / 0 warnings expected
+npm run build
 ```
 
-Then open the URL Vite prints (usually `http://localhost:5173`).
+It polls every 5 s (2 s for a while after you start a background job) and
+refreshes immediately after every action.
 
-It polls the backend every 5 seconds, so drift events, new predictions, and
-promotion requests appear automatically as your pipeline generates them —
-no manual refresh needed.
+## What the status card may claim
 
-## What's real vs. what's a placeholder
+| State | When |
+|---|---|
+| **Offline** (grey, "last updated hh:mm") | the API can't be reached; last data stays on screen, dimmed |
+| **Locked** | the admin key is missing/wrong (401) |
+| **Waiting for data** | reachable, but no drift check has ever run |
+| **Normal** | only when the most recent real check did not trigger |
+| **Drift detected** | the most recent check triggered |
 
-Everything shown is live data from your actual database — there's no mock
-or sample data baked into the dashboard itself. If a section is empty, it's
-because that part of the pipeline (drift monitor, retrain pipeline,
-evaluation gate) hasn't been run yet against your current database.
+Text that an LLM may have written is tagged "Summary - AI or template": the API
+does not record which, so the UI doesn't claim "AI".
 
 ## Structure
 
-- `src/api.js` — all backend calls in one place
-- `src/useTheme.js` — light/dark theme state, defaults to your OS preference
-- `src/App.jsx` — the whole dashboard (status strip, promotions, drift
-  events, predictions table)
-- `src/index.css` — all styling; CSS custom properties drive both themes
-  from one set of rules
+- `src/api.js` - the one request helper (adds the key, turns failures into errors with an HTTP status)
+- `src/hooks/useDashboard.js` - polling + connection state (`online | offline | locked | degraded`); keeps stale data
+- `src/hooks/useNow.js` - one shared timer for relative times and the countdown
+- `src/lib/format.js`, `src/lib/health.js` - number/time formatting; the status decision
+- `src/components/` - Header, StatusCard, KpiStrip, ActionsCard, AutomationCard, DriftMonitor, PromotionRequests, RecentPredictions, ConfirmDialog, Sparkline, CompareBar, `ui.jsx` (Button, Pill, Badge, Skeleton, ...)
+- `src/index.css` - the design system: spacing / type / colour tokens for both themes, then primitives, then sections
 
-## Note on CORS
+## CORS
 
-`serving/app.py` now allows all origins for local development so the
-dashboard (a different port) can call it from the browser. If you ever
-deploy this beyond your own machine, tighten `allow_origins` in that file.
+The API only allows the origins in `DASHBOARD_ORIGINS` (default: the local dev
+server on port 5173). Set it when you serve the dashboard from somewhere else.

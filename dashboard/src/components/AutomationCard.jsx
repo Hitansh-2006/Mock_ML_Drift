@@ -1,4 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useNow } from "../hooks/useNow";
+import { formatCountdown, formatInterval } from "../lib/format";
+import { Button, Pill, RelativeTime, Section, Skeleton } from "./ui";
 
 const INTERVALS = [
   { seconds: 15, label: "15 s" },
@@ -8,20 +11,7 @@ const INTERVALS = [
   { seconds: 900, label: "15 min" },
 ];
 
-function formatCountdown(seconds) {
-  if (seconds <= 0) return "any moment";
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return m > 0 ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
-}
-
-function formatInterval(seconds) {
-  const known = INTERVALS.find((i) => i.seconds === seconds);
-  if (known) return known.label;
-  return seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`;
-}
-
-/** Plain-words summary of the last cycle (the server writes `message`; this is the fallback). */
+/** Plain-words summary of a cycle. The server writes `message`; this covers older/partial results. */
 function describeCycle(cycle) {
   if (!cycle) return "No cycle has run yet.";
   if (cycle.message) return cycle.message;
@@ -30,124 +20,93 @@ function describeCycle(cycle) {
   return cycle.drift_checked ? "No drift" : "Waiting for traffic";
 }
 
-export function AutomationCard({ automation, state, busy, onStart, onStop, onRunNow }) {
-  // `state`: "ok" | "offline" | "locked" (401). Controls are disabled unless "ok".
-  const [now, setNow] = useState(() => Date.now());
+/**
+ * Start/Stop for the in-process automation loop.
+ * `connState`: online | offline | locked | degraded | loading. Controls only work when
+ * we actually have the loop's state from the server.
+ */
+export function AutomationCard({ automation, connState, busy, onStart, onStop, onRunNow }) {
+  const now = useNow(1);
   const [interval, setIntervalSeconds] = useState(60);
 
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
-
+  const loading = automation == null && connState === "loading";
+  const usable = !!automation && (connState === "online" || connState === "degraded");
   const running = !!automation?.running;
-  const usable = state === "ok" && automation;
   const nextIn = running && automation.next_run_at ? automation.next_run_at - now / 1000 : null;
   const last = automation?.last_cycle;
-  const lastWasError = !!last?.error;
 
-  let pill = { cls: "neutral", text: "Stopped" };
-  if (state === "offline") pill = { cls: "offline", text: "Unavailable" };
-  else if (state === "locked") pill = { cls: "offline", text: "Locked" };
-  else if (running) pill = { cls: "running", text: "Running" };
+  let pill = { tone: "neutral", text: "Stopped" };
+  if (!usable && !loading) pill = { tone: "neutral", text: connState === "locked" ? "Locked" : "Unavailable" };
+  else if (running) pill = { tone: "success", text: "Running" };
+
+  const blocked =
+    connState === "offline" ? "The serving API is not reachable."
+      : connState === "locked" ? "Enter the admin key first."
+        : !usable ? "Loading…" : undefined;
 
   return (
-    <section id="automation" aria-labelledby="automation-title">
-      <div className="automation-card">
+    <Section id="automation" title="Automation" description="Checks for drift, trains a challenger and tests it silently on live traffic.">
+      <div className="card">
         <div className="automation-head">
           <div>
-            <h2 id="automation-title">Automation</h2>
-            <p className="section-desc">
-              Checks for drift, trains a challenger and tests it on live traffic.{" "}
-              <strong>Promotions always need your approval.</strong>
-            </p>
+            <div className="card-title">Loop</div>
+            <p><strong>Promotions always need your approval.</strong> The loop can only create a request for you to review.</p>
           </div>
-          <span className={`status-pill ${pill.cls}`} role="status" aria-label={`Automation is ${pill.text}`}>
-            <span className="status-dot" aria-hidden="true" />
-            {pill.text}
-          </span>
+          <Pill tone={pill.tone} aria-label={`Automation is ${pill.text}`}>{pill.text}</Pill>
         </div>
 
-        <dl className="automation-facts">
+        <dl className="facts">
           <div>
             <dt>Next run</dt>
             <dd>
-              {!usable
-                ? "—"
-                : running
-                  ? automation.cycle_in_progress
-                    ? "running now…"
-                    : nextIn != null
-                      ? `in ${formatCountdown(nextIn)}`
-                      : "—"
-                  : "not scheduled"}
+              {loading ? <Skeleton width={80} /> : !usable ? "—"
+                : !running ? "not scheduled"
+                  : automation.cycle_in_progress ? "running now…"
+                    : nextIn != null ? `in ${formatCountdown(nextIn)}` : "—"}
             </dd>
           </div>
           <div>
             <dt>Interval</dt>
-            <dd>{usable ? `every ${formatInterval(automation.interval_seconds)}` : "—"}</dd>
+            <dd>{loading ? <Skeleton width={70} /> : usable ? `every ${formatInterval(automation.interval_seconds)}` : "—"}</dd>
           </div>
-          <div className="automation-last">
+          <div>
             <dt>Last cycle</dt>
-            <dd className={lastWasError ? "text-danger" : ""}>
-              {!usable ? "—" : describeCycle(last)}
-              {usable && automation.last_cycle_at && (
-                <span className="muted"> · {new Date(automation.last_cycle_at * 1000).toLocaleTimeString()}</span>
-              )}
+            <dd className={last?.error ? "text-danger" : ""}>
+              {loading ? <Skeleton width="70%" /> : !usable ? "—" : describeCycle(last)}
+              {usable && automation.last_cycle_at && <span className="muted"> · <RelativeTime ts={automation.last_cycle_at} /></span>}
             </dd>
           </div>
         </dl>
 
-        <div className="automation-actions">
+        <div className="row-actions">
           {running ? (
-            <button
-              type="button"
-              className="action-btn secondary"
-              onClick={onStop}
-              disabled={!usable || busy === "stop"}
-              aria-label="Stop the automation loop"
-            >
-              {busy === "stop" ? <><span className="spinner" /> Stopping…</> : "Stop automation"}
-            </button>
+            <Button loading={busy === "stop"} loadingLabel="Stopping…" disabledReason={blocked} onClick={onStop} aria-label="Stop the automation loop">
+              Stop automation
+            </Button>
           ) : (
             <>
-              <label className="automation-interval">
+              <label className="field">
                 <span>Check every</span>
-                <select
-                  value={interval}
-                  onChange={(e) => setIntervalSeconds(Number(e.target.value))}
-                  disabled={!usable || busy === "start"}
-                >
-                  {INTERVALS.map((i) => (
-                    <option key={i.seconds} value={i.seconds}>{i.label}</option>
-                  ))}
+                <select value={interval} onChange={(e) => setIntervalSeconds(Number(e.target.value))} disabled={!usable || busy === "start"}>
+                  {INTERVALS.map((i) => <option key={i.seconds} value={i.seconds}>{i.label}</option>)}
                 </select>
               </label>
-              <button
-                type="button"
-                className="action-btn primary"
-                onClick={() => onStart(interval)}
-                disabled={!usable || busy === "start"}
-                aria-label="Start the automation loop"
-              >
-                {busy === "start" ? <><span className="spinner" /> Starting…</> : "Start automation"}
-              </button>
+              <Button variant="primary" loading={busy === "start"} loadingLabel="Starting…" disabledReason={blocked} onClick={() => onStart(interval)} aria-label="Start the automation loop">
+                Start automation
+              </Button>
             </>
           )}
-          <button
-            type="button"
-            className="action-btn secondary"
+          <Button
+            loading={busy === "run"} loadingLabel="Starting…"
+            disabledReason={blocked || (automation?.cycle_in_progress ? "A cycle is already running." : undefined)}
             onClick={onRunNow}
-            disabled={!usable || busy === "run" || automation?.cycle_in_progress}
-            title="Run one drift → retrain → gate cycle right now"
           >
-            {busy === "run" ? <><span className="spinner" /> Starting…</> : "Run once now"}
-          </button>
+            Run once now
+          </Button>
         </div>
-
-        {state === "offline" && <p className="automation-note">The serving API is not reachable, so the loop state is unknown.</p>}
-        {state === "locked" && <p className="automation-note">Enter the admin key above to see and control the loop.</p>}
+        {connState === "offline" && <p className="note">The serving API is not reachable, so the loop's state is unknown.</p>}
+        {connState === "locked" && <p className="note">Enter the admin key above to see and control the loop.</p>}
       </div>
-    </section>
+    </Section>
   );
 }
