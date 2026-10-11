@@ -51,3 +51,8 @@ models/*_v*.meta.json
 .venv/
 node_modules/
 
+
+# Old extracted copy (proj/): same rule as models/ - no generated v2+ artifacts, no install logs
+proj/**/models/*_v[2-9]*
+proj/**/models/*_v[1-9][0-9]*
+proj/**/npm-ci.*
