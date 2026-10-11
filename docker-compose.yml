@@ -1,0 +1,79 @@
+# Brings up the whole pipeline: Postgres, the serving API, the automation
+# loop (drift monitor + retrain + evaluation gate on a schedule), and the
+# dashboard. Run with:
+#     docker compose up --build
+#
+# NOTE: this file has been written carefully but NOT run in a live Docker
+# environment as part of building it (Claude's build sandbox doesn't have
+# Docker available). Test it yourself with `docker compose up --build`
+# and tell me what breaks, if anything — the Postgres connection, the
+# retrain/serving code, and the dashboard's API calls have all been
+# tested directly, just not through Compose itself.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: driftwatchdog
+      POSTGRES_USER: driftwatchdog
+      POSTGRES_PASSWORD: driftwatchdog
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U driftwatchdog"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  serving:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn serving.app:app --host 0.0.0.0 --port 8000
+    environment:
+      DRIFT_WATCHDOG_DB_URL: postgresql://driftwatchdog:driftwatchdog@postgres:5432/driftwatchdog
+      # Compose refuses to start if this isn't set in .env (see .env.example)
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env - see .env.example}
+      DASHBOARD_ORIGINS: ${DASHBOARD_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  automation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m automation.loop
+    environment:
+      DRIFT_WATCHDOG_DB_URL: postgresql://driftwatchdog:driftwatchdog@postgres:5432/driftwatchdog
+      SERVING_API_URL: http://serving:8000
+      CHECK_INTERVAL_SECONDS: "60"
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env - see .env.example}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      serving:
+        condition: service_started
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      - serving
+
+volumes:
+  pgdata:

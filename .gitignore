@@ -1,0 +1,53 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python testing/cache
+.pytest_cache/
+.mypy_cache/
+
+# ML experiment artifacts
+runs/
+wandb/
+mlruns/
+
+# Logs
+*.log
+
+# Retrain version reservations and dashboard-upload temp/backup files
+models/.reserve_v*
+data/.stream_upload_*.tmp
+data/stream_data.bak.csv
+
+# Generated model artifacts: only the v1 baseline is tracked (v2+ come from retraining)
+models/*_v*.joblib
+models/*_v*.meta.json
+!models/*_v1.joblib
+!models/*_v1.meta.json
+
+# Local tooling
+.venv/
+node_modules/
+
