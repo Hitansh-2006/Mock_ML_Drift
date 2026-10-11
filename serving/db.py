@@ -107,6 +107,21 @@ class ModelRegistry(Base):
     )
 
 
+class AutomationState(Base):
+    """
+    One row (id=1): whether the dashboard's automation loop is switched on, its
+    interval and a summary of the last cycle, so the loop survives a restart.
+    """
+    __tablename__ = "automation_state"
+
+    id = Column(Integer, primary_key=True)
+    enabled = Column(Boolean, default=False, nullable=False)
+    interval_seconds = Column(Integer, nullable=True)
+    started_at = Column(Float, nullable=True)
+    last_cycle_at = Column(Float, nullable=True)
+    last_cycle = Column(JSON, nullable=True)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     # Ensure newly added columns exist in existing SQLite or Postgres tables

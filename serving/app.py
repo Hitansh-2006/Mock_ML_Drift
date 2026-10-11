@@ -26,9 +26,11 @@ import joblib
 import numpy as np
 from fastapi import APIRouter, FastAPI, Depends, HTTPException, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from automation.controller import AutomationController, MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS
+from automation.loop import CycleDeps
 from serving import registry
 from serving.db import init_db, get_session, SessionLocal, PredictionLog, PromotionRequest, DriftEvent
 from data.house_price_preprocessor import HousePricePreprocessor
@@ -53,7 +55,9 @@ REGISTRY_LOCK = threading.RLock()
 @asynccontextmanager
 async def lifespan(_app):
     startup()
+    AUTOMATION.restore()      # switch the loop back on if it was on before the restart
     yield
+    AUTOMATION.shutdown()     # stop the scheduler; `enabled` stays set so the next boot restores it
 
 
 app = FastAPI(title="Drift-Watchdog Serving Service", lifespan=lifespan)
@@ -631,6 +635,56 @@ def retrain_endpoint(background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_retrain)
     return {"status": "started", "message": "Retrain started in background. Watch /status for the new shadow version."}
+
+
+# --- automation loop (dashboard Start/Stop button) -----------------------------
+def _deploy_shadow_directly(version: str) -> dict:
+    """What the in-process loop uses instead of POSTing to its own /admin/set_shadow."""
+    db = SessionLocal()
+    try:
+        return apply_set_shadow(version, db)
+    except TransitionError as e:
+        raise RuntimeError(f"set_shadow refused ({e.status_code}): {e.detail}")
+    finally:
+        db.close()
+
+
+def _automation_deps() -> CycleDeps:
+    # RETRAIN_LOCK is the same lock /admin/retrain takes: one retrain at a time, button or loop.
+    return CycleDeps(get_status=status, deploy_shadow=_deploy_shadow_directly, retrain_lock=RETRAIN_LOCK)
+
+
+AUTOMATION = AutomationController(deps_factory=_automation_deps)
+
+
+class AutomationStartRequest(BaseModel):
+    interval_seconds: Optional[int] = Field(default=None, ge=MIN_INTERVAL_SECONDS, le=MAX_INTERVAL_SECONDS)
+
+
+@admin.get("/automation")
+def automation_status():
+    """Is the loop on, when does it next run, and what did the last cycle do?"""
+    return AUTOMATION.status()
+
+
+@admin.post("/automation/start")
+def automation_start(req: Optional[AutomationStartRequest] = None):
+    """Starts the loop (idempotent). The loop only ever creates *pending* promotion requests."""
+    return AUTOMATION.start(req.interval_seconds if req else None)
+
+
+@admin.post("/automation/stop")
+def automation_stop():
+    """Stops the loop (idempotent). A cycle that is already running finishes."""
+    return AUTOMATION.stop()
+
+
+@admin.post("/automation/run_now")
+def automation_run_now():
+    """Runs one cycle immediately in the background (handy for demos)."""
+    if not AUTOMATION.run_now():
+        raise HTTPException(409, "An automation cycle is already running.")
+    return {"status": "started"}
 
 
 # Registered last so every route above is attached to the router first.

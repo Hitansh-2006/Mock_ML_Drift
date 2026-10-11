@@ -166,11 +166,13 @@ def deploy_shadow(version_name):
     return resp.json()
 
 
-def run_retrain(n_recent):
+def run_retrain(n_recent, deploy=None):
     """
     Callable entry point (used by the CLI below and by the automation loop).
     Returns the new version name on success, or None if there wasn't enough
-    labeled data yet to retrain on.
+    labeled data yet to retrain on. `deploy(version)` puts the new model in
+    shadow; the default calls the serving API over HTTP, the in-process loop
+    passes a direct function instead.
     """
     print(f"Pulling the {n_recent} most recent labeled predictions from prediction_logs...")
     df = load_recent_labeled_data(n_recent)
@@ -186,8 +188,8 @@ def run_retrain(n_recent):
         print(f"Saved {model_path.name} | Log RMSE={metrics['log_rmse']:.4f} | MAE=${metrics['mae']:,.0f}")
 
         print(f"Deploying {version} to shadow mode (production traffic unaffected)...")
-        result = deploy_shadow(version)
-        print(f"Serving API confirms: shadow_version = {result['shadow_version']}")
+        result = (deploy or deploy_shadow)(version)
+        print(f"Shadow slot confirms: shadow_version = {result['shadow_version']}")
         print("Production is still serving the original model. Nothing has been promoted.")
         return version
     finally:

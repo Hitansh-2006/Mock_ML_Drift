@@ -91,13 +91,27 @@ def load_paired_data(production_version, shadow_version):
 
 
 def run_gate(min_samples):
-    status = requests.get(f"{API_URL}/status", timeout=5).json()
+    """CLI/back-compat entry point: the promotion request id touched this run, or None."""
+    return evaluate(min_samples).get("promotion_request_id")
+
+
+def evaluate(min_samples, status=None):
+    """
+    One gate pass. Returns a dict the automation loop can report:
+      outcome: no_shadow | waiting | no_new_data | request_created | request_updated
+               | request_withdrawn | not_passed
+    plus n / min_samples / promotion_request_id where they apply.
+    `status` is {"production_version", "shadow_version"}; pass it when running
+    inside the serving process, otherwise it is fetched from the API.
+    """
+    if status is None:
+        status = requests.get(f"{API_URL}/status", timeout=5).json()
     production_version = status["production_version"]
     shadow_version = status["shadow_version"]
 
     if not shadow_version:
         print("No shadow model is currently deployed. Nothing to evaluate.")
-        return None
+        return {"outcome": "no_shadow"}
 
     # If there's already a pending request for THIS challenger, we UPDATE
     # its numbers as more evidence comes in rather than either (a) creating
@@ -130,12 +144,13 @@ def run_gate(min_samples):
 
     if n < min_samples:
         print(f"Not enough paired labeled data yet ({n}/{min_samples}). Send more traffic and re-run.")
-        return None
+        return {"outcome": "waiting", "n": n, "min_samples": min_samples, "challenger_version": shadow_version}
 
     if existing_pending and n == existing_pending.n_labels_compared:
         print(f"No new paired data since promotion request #{existing_pending.id} was created "
               f"(still {n} samples). Nothing to update.")
-        return existing_pending.id
+        return {"outcome": "no_new_data", "n": n, "min_samples": min_samples,
+                "challenger_version": shadow_version, "promotion_request_id": existing_pending.id}
 
     prod_mae = float(np.mean(prod_errors))
     shadow_mae = float(np.mean(shadow_errors))
@@ -188,7 +203,9 @@ def run_gate(min_samples):
             db.commit()
         finally:
             db.close()
-        return existing_pending.id
+        return {"outcome": "request_updated" if passes_gate else "request_withdrawn", "n": n,
+                "min_samples": min_samples, "challenger_version": shadow_version,
+                "promotion_request_id": existing_pending.id}
 
     if passes_gate:
         explanation = explain_promotion(
@@ -220,13 +237,15 @@ def run_gate(min_samples):
         finally:
             db.close()
         print(f"\n>>> GATE PASSED. Promotion request #{promo.id} created — awaiting human approval.")
-        print(f">>> Nothing has been promoted. Approve or reject via POST /admin/promote.")
-        return promo.id
+        print(f">>> Nothing has been promoted. A human approves or rejects it in the dashboard.")
+        return {"outcome": "request_created", "n": n, "min_samples": min_samples,
+                "challenger_version": shadow_version, "promotion_request_id": promo.id}
     else:
         reason = "challenger is not actually better on average" if not challenger_better \
             else "improvement is not statistically significant yet (could be noise)"
         print(f"\nGate not passed: {reason}. No promotion request created.")
-        return None
+        return {"outcome": "not_passed", "n": n, "min_samples": min_samples,
+                "challenger_version": shadow_version, "reason": reason, "p_value": float(p_value)}
 
 
 def main():
