@@ -18,6 +18,7 @@ import shutil
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -28,7 +29,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from serving.db import init_db, get_session, PredictionLog, PromotionRequest, DriftEvent
+from serving import registry
+from serving.db import init_db, get_session, SessionLocal, PredictionLog, PromotionRequest, DriftEvent
 from data.house_price_preprocessor import HousePricePreprocessor
 from serving.security import require_admin, auth_mode
 
@@ -43,8 +45,18 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # One baseline-training job and one retrain job at a time (single serving process).
 TRAIN_LOCK = threading.Lock()
 RETRAIN_LOCK = threading.Lock()
+# Serialises registry transitions (set_shadow / approve / reject) so "write the DB,
+# then update the cache" is atomic with respect to other requests in this process.
+REGISTRY_LOCK = threading.RLock()
 
-app = FastAPI(title="Drift-Watchdog Serving Service")
+
+@asynccontextmanager
+async def lifespan(_app):
+    startup()
+    yield
+
+
+app = FastAPI(title="Drift-Watchdog Serving Service", lifespan=lifespan)
 
 # Only the dashboard's origin(s) may call this API from a browser. Defaults to
 # the local dev server (5173) and the Docker Compose dashboard (also 5173).
@@ -63,8 +75,13 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-API-Key"],
 )
 
-# --- in-memory model registry -------------------------------------------------
-# Each version now needs a MODEL + a PREPROCESSOR loaded together: a raw
+# --- in-memory cache of the DB model registry ---------------------------------
+# The model_registry table is the source of truth for which version is
+# production / shadow; startup() fills these two keys from it and every change
+# writes the DB first. The cache only exists so /predict doesn't hit the DB for
+# the version on every request. Single serving process only (one uvicorn worker).
+#
+# Each version needs a MODEL + a PREPROCESSOR loaded together: a raw
 # feature dict (e.g. {"OverallQual": 7, "Neighborhood": "CollgCr", ...})
 # has to go through that version's fitted preprocessor before the model can
 # score it. They're always saved and loaded as a pair.
@@ -90,9 +107,59 @@ def load_model(version: str):
     return STATE["models"][version]
 
 
-@app.on_event("startup")
+class TransitionError(Exception):
+    """A refused registry transition; the HTTP layer turns it into an HTTPException."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+def _sync_cache(db: Session):
+    """Copy the DB's production/shadow roles into STATE. Call only after the DB write committed."""
+    prod, shadow = registry.current_roles(db)
+    STATE["production_version"] = prod or STATE["production_version"]
+    STATE["shadow_version"] = shadow
+
+
+def apply_set_shadow(version: str, db: Session) -> dict:
+    """
+    Deploys `version` to the shadow slot: files must exist and load, then the
+    registry is updated (old shadow archived) and only then the cache. Used by
+    POST /admin/set_shadow and directly (no HTTP) by the in-process automation loop.
+    """
+    with REGISTRY_LOCK:
+        if not (MODELS_DIR / f"model_{version}.joblib").exists() \
+                or not (MODELS_DIR / f"preprocessor_{version}.joblib").exists():
+            raise TransitionError(404, f"Missing model or preprocessor file for version {version}")
+        _load_or_raise(version)
+        try:
+            registry.set_shadow(db, version, registry.describe(MODELS_DIR, version))
+        except registry.RegistryError as e:
+            raise TransitionError(e.status_code, e.detail)
+        _sync_cache(db)
+        return {"status": "ok", "shadow_version": version}
+
+
+def _load_or_raise(version: str):
+    try:
+        return load_model(version)
+    except Exception as e:  # missing file, corrupt joblib, incompatible pickle...
+        raise TransitionError(500, f"Model {version} could not be loaded: {e}")
+
+
 def startup():
+    """Boot logic: create tables, seed the registry on a legacy DB, load STATE from it."""
     init_db()
+    db = SessionLocal()
+    try:
+        if registry.seed_if_empty(db, MODELS_DIR):
+            print(f"[startup] model_registry was empty - seeded production={registry.current_roles(db)[0]} "
+                  f"from existing promotion requests.")
+        _sync_cache(db)
+    finally:
+        db.close()
     try:
         load_model(STATE["production_version"])
     except FileNotFoundError as e:
@@ -156,10 +223,11 @@ def predict(req: PredictRequest, db: Session = Depends(get_session)):
 
     # if a shadow challenger is active, score it too (logged, never returned
     # to the caller, never affects the served prediction)
-    if STATE["shadow_version"]:
+    shadow_version = STATE["shadow_version"]  # read once: it can change mid-request
+    if shadow_version:
         try:
             t_shadow_0 = time.perf_counter()
-            shadow = load_model(STATE["shadow_version"])
+            shadow = load_model(shadow_version)
             shadow_X = shadow["preprocessor"].transform_single(req.features)
             shadow_pred = float(np.expm1(shadow["model"].predict(shadow_X)[0]))
             shadow_latency_ms = round((time.perf_counter() - t_shadow_0) * 1000.0, 2)
@@ -168,14 +236,16 @@ def predict(req: PredictRequest, db: Session = Depends(get_session)):
                 timestep=req.timestep,
                 features=req.features,
                 prediction=shadow_pred,
-                model_version=STATE["shadow_version"],
+                model_version=shadow_version,
                 is_shadow=True,
                 latency_ms=shadow_latency_ms,
             )
             db.add(shadow_log)
             db.commit()
-        except FileNotFoundError:
-            pass  # shadow model file not written yet; skip silently
+        except Exception as e:
+            # Shadow scoring is log-only: a missing/corrupt shadow must never fail the caller's request.
+            db.rollback()
+            print(f"[predict] shadow {shadow_version} skipped: {e}")
 
     return PredictResponse(
         prediction=pred,
@@ -281,19 +351,17 @@ class SetShadowRequest(BaseModel):
 
 
 @admin.post("/set_shadow")
-def set_shadow(req: SetShadowRequest):
+def set_shadow(req: SetShadowRequest, db: Session = Depends(get_session)):
     """
-    Points the shadow slot at a new challenger model version. Deliberately
-    has NO equivalent for production — promoting to production only ever
-    happens through a separate, explicitly human-approved path (step 4).
+    Points the shadow slot at a new challenger model version (the previous
+    shadow, if any, is archived). Deliberately has NO equivalent for
+    production — promoting to production only ever happens through a
+    separate, explicitly human-approved path (/admin/promote).
     """
-    model_path = MODELS_DIR / f"model_{req.version}.joblib"
-    preproc_path = MODELS_DIR / f"preprocessor_{req.version}.joblib"
-    if not model_path.exists() or not preproc_path.exists():
-        raise HTTPException(404, f"Missing model or preprocessor file for version {req.version}")
-    load_model(req.version)  # eagerly load + validate it actually loads
-    STATE["shadow_version"] = req.version
-    return {"status": "ok", "shadow_version": req.version}
+    try:
+        return apply_set_shadow(req.version, db)
+    except TransitionError as e:
+        raise HTTPException(e.status_code, e.detail)
 
 
 class PromotionDecisionRequest(BaseModel):
@@ -336,28 +404,34 @@ def decide_promotion(req: PromotionDecisionRequest, db: Session = Depends(get_se
     if req.decision not in ("approve", "reject"):
         raise HTTPException(400, "decision must be 'approve' or 'reject'")
 
-    promo = db.query(PromotionRequest).filter(PromotionRequest.id == req.promotion_request_id).first()
-    if not promo:
-        raise HTTPException(404, "promotion request not found")
-    if promo.status != "pending":
-        raise HTTPException(400, f"promotion request is already '{promo.status}'")
+    with REGISTRY_LOCK:
+        promo = db.query(PromotionRequest).filter(PromotionRequest.id == req.promotion_request_id).first()
+        if not promo:
+            raise HTTPException(404, "promotion request not found")
+        if promo.status != "pending":
+            raise HTTPException(400, f"promotion request is already '{promo.status}'")
 
-    promo.status = "approved" if req.decision == "approve" else "rejected"
-    promo.decided_at = time.time()
-    promo.decided_by = req.decided_by
-    db.commit()
+        try:
+            if req.decision == "approve":
+                # Validate BEFORE touching the DB: an unloadable challenger must
+                # leave the request pending and production untouched (BUG-7).
+                registry.assert_promotable(db, promo)
+                _load_or_raise(promo.challenger_version)
+                registry.promote(db, promo, req.decided_by)
+            else:
+                registry.reject(db, promo, req.decided_by)
+        except registry.RegistryError as e:
+            raise HTTPException(e.status_code, e.detail)
+        except TransitionError as e:
+            raise HTTPException(e.status_code, e.detail)
+        _sync_cache(db)  # DB committed; now the cache follows
 
-    if req.decision == "approve":
-        load_model(promo.challenger_version)  # confirm it loads before switching
-        STATE["production_version"] = promo.challenger_version
-        STATE["shadow_version"] = None  # clear shadow slot; nothing left to test against itself
-
-    return {
-        "status": "ok",
-        "promotion_status": promo.status,
-        "production_version": STATE["production_version"],
-        "shadow_version": STATE["shadow_version"],
-    }
+        return {
+            "status": "ok",
+            "promotion_status": promo.status,
+            "production_version": STATE["production_version"],
+            "shadow_version": STATE["shadow_version"],
+        }
 
 
 # --- aggregate stats (KPI strip) -----------------------------------------------

@@ -7,7 +7,7 @@ code is unchanged since it's all through SQLAlchemy.
 import os
 import time
 from sqlalchemy import (
-    create_engine, Column, Integer, Float, String, Boolean, JSON, DateTime
+    create_engine, Column, Integer, Float, String, Boolean, JSON, DateTime, Index, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -78,6 +78,33 @@ class PromotionRequest(Base):
     decided_at = Column(Float, nullable=True)
     decided_by = Column(String, nullable=True)
     explanation = Column(String, nullable=True)  # optional LLM-generated plain-English summary
+
+
+class ModelRegistry(Base):
+    """
+    The DB is the source of truth for which model serves production and which
+    one (if any) runs in shadow; the in-memory STATE in serving/app.py is only a
+    cache of this table for the /predict hot path. Roles:
+      production | shadow | archived | rejected
+    The partial unique indexes make "at most one production, at most one
+    shadow" a database guarantee, not just a convention in code.
+    """
+    __tablename__ = "model_registry"
+
+    version = Column(String, primary_key=True)
+    role = Column(String, nullable=False)
+    created_at = Column(Float, default=time.time)
+    promoted_at = Column(Float, nullable=True)       # set when the version became production
+    trained_on_rows = Column(Integer, nullable=True)  # from model_<v>.meta.json when present
+    metrics = Column(JSON, nullable=True)             # the same meta file, verbatim
+    reference_path = Column(String, nullable=True)    # reserved for per-version drift references (FR-2)
+
+    __table_args__ = (
+        Index("uq_model_registry_one_production", "role", unique=True,
+              sqlite_where=text("role = 'production'"), postgresql_where=text("role = 'production'")),
+        Index("uq_model_registry_one_shadow", "role", unique=True,
+              sqlite_where=text("role = 'shadow'"), postgresql_where=text("role = 'shadow'")),
+    )
 
 
 def init_db():
