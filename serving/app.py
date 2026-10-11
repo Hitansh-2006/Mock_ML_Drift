@@ -1,0 +1,563 @@
+"""
+The serving service. Responsibilities:
+  1. Load the current production model (and, if one is running, a shadow
+     challenger model) at startup.
+  2. Serve predictions on the current production model only.
+  3. Log every prediction (features, prediction, model version, timestep)
+     to the DB — this log is what the drift monitor and evaluation gate
+     read from.
+  4. Accept true labels later (delayed-label problem) via /label.
+  5. Never auto-promote anything — /admin/promote is a separate,
+     human-triggered concern (added in the evaluation-gate step).
+
+Run with: uvicorn serving.app:app --reload --port 8000
+"""
+import json
+import os
+import shutil
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+import joblib
+import numpy as np
+from fastapi import APIRouter, FastAPI, Depends, HTTPException, UploadFile, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from serving.db import init_db, get_session, PredictionLog, PromotionRequest, DriftEvent
+from data.house_price_preprocessor import HousePricePreprocessor
+from serving.security import require_admin, auth_mode
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+MODELS_DIR = ROOT_DIR / "models"
+DATA_DIR = ROOT_DIR / "data"
+TRAINING_PATH = DATA_DIR / "training_data.csv"
+
+# Uploaded stream files larger than this are rejected (the house-price stream is ~0.2 MB).
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+# One baseline-training job and one retrain job at a time (single serving process).
+TRAIN_LOCK = threading.Lock()
+RETRAIN_LOCK = threading.Lock()
+
+app = FastAPI(title="Drift-Watchdog Serving Service")
+
+# Only the dashboard's origin(s) may call this API from a browser. Defaults to
+# the local dev server (5173) and the Docker Compose dashboard (also 5173).
+# Deploying elsewhere? Set DASHBOARD_ORIGINS="https://dash.example.com,...".
+DASHBOARD_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "DASHBOARD_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    ).split(",")
+    if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=DASHBOARD_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key"],
+)
+
+# --- in-memory model registry -------------------------------------------------
+# Each version now needs a MODEL + a PREPROCESSOR loaded together: a raw
+# feature dict (e.g. {"OverallQual": 7, "Neighborhood": "CollgCr", ...})
+# has to go through that version's fitted preprocessor before the model can
+# score it. They're always saved and loaded as a pair.
+STATE = {
+    "production_version": "v1",
+    "shadow_version": None,
+    "models": {},  # version -> {"model": ..., "preprocessor": ...}
+}
+
+
+def load_model(version: str):
+    if version not in STATE["models"]:
+        model_path = MODELS_DIR / f"model_{version}.joblib"
+        preproc_path = MODELS_DIR / f"preprocessor_{version}.joblib"
+        if not model_path.exists():
+            raise FileNotFoundError(f"No model file for version {version} at {model_path}")
+        if not preproc_path.exists():
+            raise FileNotFoundError(f"No preprocessor file for version {version} at {preproc_path}")
+        STATE["models"][version] = {
+            "model": joblib.load(model_path),
+            "preprocessor": HousePricePreprocessor.load(preproc_path),
+        }
+    return STATE["models"][version]
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+    try:
+        load_model(STATE["production_version"])
+    except FileNotFoundError as e:
+        print(f"[startup] WARNING: {e}. /predict will return 503 until a baseline model "
+              f"exists (dashboard: Train Baseline, or `python -m models.train_baseline`).")
+    mode = auth_mode()
+    if mode == "locked":
+        print("[startup] WARNING: ADMIN_API_KEY is not set - the /admin API is LOCKED (503). "
+              "Set ADMIN_API_KEY, or ADMIN_AUTH_DISABLED=1 for local development only.")
+    elif mode == "disabled":
+        print("[startup] WARNING: ADMIN_AUTH_DISABLED=1 - /admin endpoints are UNPROTECTED. Local dev only.")
+
+
+# --- schemas -------------------------------------------------------------------
+class PredictRequest(BaseModel):
+    features: dict  # e.g. {"feature_0": 0.12, "feature_1": -1.3, ...}
+    timestep: Optional[int] = None
+
+
+class PredictResponse(BaseModel):
+    prediction: float
+    model_version: str
+    log_id: int
+    latency_ms: Optional[float] = None
+
+
+class LabelRequest(BaseModel):
+    log_id: int
+    true_label: float
+
+
+# --- endpoints -------------------------------------------------------------------
+@app.post("/predict", response_model=PredictResponse)
+def predict(req: PredictRequest, db: Session = Depends(get_session)):
+    prod_version = STATE["production_version"]
+    try:
+        prod = load_model(prod_version)
+    except FileNotFoundError:
+        raise HTTPException(
+            503, "No production model is available yet. Train the baseline first "
+                 "(dashboard: Train Baseline, or `python -m models.train_baseline`)."
+        )
+
+    t0 = time.perf_counter()
+    X = prod["preprocessor"].transform_single(req.features)
+    pred_log = prod["model"].predict(X)[0]
+    pred = float(np.expm1(pred_log))  # model predicts log1p(SalePrice); invert for a real dollar figure
+    prod_latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+    log = PredictionLog(
+        timestep=req.timestep,
+        features=req.features,
+        prediction=pred,
+        model_version=prod_version,
+        is_shadow=False,
+        latency_ms=prod_latency_ms,
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+
+    # if a shadow challenger is active, score it too (logged, never returned
+    # to the caller, never affects the served prediction)
+    if STATE["shadow_version"]:
+        try:
+            t_shadow_0 = time.perf_counter()
+            shadow = load_model(STATE["shadow_version"])
+            shadow_X = shadow["preprocessor"].transform_single(req.features)
+            shadow_pred = float(np.expm1(shadow["model"].predict(shadow_X)[0]))
+            shadow_latency_ms = round((time.perf_counter() - t_shadow_0) * 1000.0, 2)
+
+            shadow_log = PredictionLog(
+                timestep=req.timestep,
+                features=req.features,
+                prediction=shadow_pred,
+                model_version=STATE["shadow_version"],
+                is_shadow=True,
+                latency_ms=shadow_latency_ms,
+            )
+            db.add(shadow_log)
+            db.commit()
+        except FileNotFoundError:
+            pass  # shadow model file not written yet; skip silently
+
+    return PredictResponse(
+        prediction=pred,
+        model_version=prod_version,
+        log_id=log.id,
+        latency_ms=prod_latency_ms,
+    )
+
+
+@app.post("/label")
+def submit_label(req: LabelRequest, db: Session = Depends(get_session)):
+    """
+    Attaches a true label to a previously-logged prediction, once it's
+    known (this is the delayed-label problem — e.g. actual delivery time
+    is only known after the delivery happens). Also back-fills the
+    matching shadow prediction for the same timestep, if one exists.
+    """
+    log = db.query(PredictionLog).filter(PredictionLog.id == req.log_id).first()
+    if not log:
+        raise HTTPException(404, "log_id not found")
+    log.true_label = req.true_label
+
+    if log.timestep is not None and not log.is_shadow:
+        shadow_log = (
+            db.query(PredictionLog)
+            .filter(
+                PredictionLog.timestep == log.timestep,
+                PredictionLog.is_shadow == True,  # noqa: E712
+            )
+            .first()
+        )
+        if shadow_log:
+            shadow_log.true_label = req.true_label
+
+    db.commit()
+    return {"status": "ok", "log_id": req.log_id}
+
+
+@app.get("/status")
+def status():
+    return {
+        "production_version": STATE["production_version"],
+        "shadow_version": STATE["shadow_version"],
+        "baseline_ready": _baseline_exists(),
+    }
+
+
+def _baseline_exists() -> bool:
+    """True only if all three baseline files exist (train() writes the metadata file last)."""
+    return all(
+        (MODELS_DIR / name).exists()
+        for name in ("model_v1.joblib", "preprocessor_v1.joblib", "model_v1.meta.json")
+    )
+
+
+# Every /admin/* route below hangs off this router, so the API-key check is
+# applied in exactly one place and can't be forgotten on a new endpoint.
+admin = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
+
+
+@admin.get("/predictions")
+def list_predictions(limit: int = 50, db: Session = Depends(get_session)):
+    """Most recent predictions (production + shadow), newest first."""
+    rows = db.query(PredictionLog).order_by(PredictionLog.id.desc()).limit(limit).all()
+    return [
+        {
+            "id": r.id,
+            "timestep": r.timestep,
+            "model_version": r.model_version,
+            "is_shadow": r.is_shadow,
+            "prediction": r.prediction,
+            "true_label": r.true_label,
+            "latency_ms": r.latency_ms,
+            "served_at": r.served_at,
+        }
+        for r in rows
+    ]
+
+
+@admin.get("/drift_events")
+def list_drift_events(limit: int = 20, db: Session = Depends(get_session)):
+    """Most recent drift-monitor checks, newest first."""
+    rows = db.query(DriftEvent).order_by(DriftEvent.id.desc()).limit(limit).all()
+    return [
+        {
+            "id": r.id,
+            "checked_at": r.checked_at,
+            "window_start_timestep": r.window_start_timestep,
+            "window_end_timestep": r.window_end_timestep,
+            "drift_score": r.drift_score,
+            "method": r.method,
+            "threshold": r.threshold,
+            "triggered": r.triggered,
+            "details": r.details,
+            "explanation": r.explanation,
+        }
+        for r in rows
+    ]
+
+
+class SetShadowRequest(BaseModel):
+    version: str
+
+
+@admin.post("/set_shadow")
+def set_shadow(req: SetShadowRequest):
+    """
+    Points the shadow slot at a new challenger model version. Deliberately
+    has NO equivalent for production — promoting to production only ever
+    happens through a separate, explicitly human-approved path (step 4).
+    """
+    model_path = MODELS_DIR / f"model_{req.version}.joblib"
+    preproc_path = MODELS_DIR / f"preprocessor_{req.version}.joblib"
+    if not model_path.exists() or not preproc_path.exists():
+        raise HTTPException(404, f"Missing model or preprocessor file for version {req.version}")
+    load_model(req.version)  # eagerly load + validate it actually loads
+    STATE["shadow_version"] = req.version
+    return {"status": "ok", "shadow_version": req.version}
+
+
+class PromotionDecisionRequest(BaseModel):
+    promotion_request_id: int
+    decision: str  # "approve" or "reject" — nothing else is accepted
+    decided_by: Optional[str] = None
+
+
+@admin.get("/promotion_requests")
+def list_promotion_requests(db: Session = Depends(get_session)):
+    """Lists pending promotion requests for a human to review."""
+    rows = db.query(PromotionRequest).order_by(PromotionRequest.id.desc()).all()
+    return [
+        {
+            "id": r.id,
+            "challenger_version": r.challenger_version,
+            "production_version_at_request": r.production_version_at_request,
+            "challenger_mae": r.challenger_mae,
+            "production_mae": r.production_mae,
+            "challenger_latency_ms": r.challenger_latency_ms,
+            "production_latency_ms": r.production_latency_ms,
+            "n_labels_compared": r.n_labels_compared,
+            "status": r.status,
+            "created_at": r.created_at,
+            "explanation": r.explanation,
+        }
+        for r in rows
+    ]
+
+
+@admin.post("/promote")
+def decide_promotion(req: PromotionDecisionRequest, db: Session = Depends(get_session)):
+    """
+    THE ONLY code path in this entire system that can change which model
+    serves production traffic. Requires an explicit human decision on an
+    existing promotion request created by the evaluation gate — there is no
+    way to promote a model that hasn't already passed the statistical gate,
+    and no automatic path that calls this endpoint on its own.
+    """
+    if req.decision not in ("approve", "reject"):
+        raise HTTPException(400, "decision must be 'approve' or 'reject'")
+
+    promo = db.query(PromotionRequest).filter(PromotionRequest.id == req.promotion_request_id).first()
+    if not promo:
+        raise HTTPException(404, "promotion request not found")
+    if promo.status != "pending":
+        raise HTTPException(400, f"promotion request is already '{promo.status}'")
+
+    promo.status = "approved" if req.decision == "approve" else "rejected"
+    promo.decided_at = time.time()
+    promo.decided_by = req.decided_by
+    db.commit()
+
+    if req.decision == "approve":
+        load_model(promo.challenger_version)  # confirm it loads before switching
+        STATE["production_version"] = promo.challenger_version
+        STATE["shadow_version"] = None  # clear shadow slot; nothing left to test against itself
+
+    return {
+        "status": "ok",
+        "promotion_status": promo.status,
+        "production_version": STATE["production_version"],
+        "shadow_version": STATE["shadow_version"],
+    }
+
+
+# --- aggregate stats (KPI strip) -----------------------------------------------
+@admin.get("/stats")
+def get_stats(db: Session = Depends(get_session)):
+    """Aggregate numbers for the dashboard KPI strip."""
+    total_predictions = db.query(PredictionLog).filter(
+        PredictionLog.is_shadow == False  # noqa: E712
+    ).count()
+    total_labeled = db.query(PredictionLog).filter(
+        PredictionLog.is_shadow == False,  # noqa: E712
+        PredictionLog.true_label.isnot(None),
+    ).count()
+    shadow_predictions = db.query(PredictionLog).filter(
+        PredictionLog.is_shadow == True  # noqa: E712
+    ).count()
+
+    recent_labeled = (
+        db.query(PredictionLog)
+        .filter(
+            PredictionLog.is_shadow == False,  # noqa: E712
+            PredictionLog.true_label.isnot(None),
+        )
+        .order_by(PredictionLog.id.desc())
+        .limit(200)
+        .all()
+    )
+    recent_prod = (
+        db.query(PredictionLog)
+        .filter(
+            PredictionLog.is_shadow == False,  # noqa: E712
+        )
+        .order_by(PredictionLog.id.desc())
+        .limit(100)
+        .all()
+    )
+    production_latency_ms = None
+    if recent_prod:
+        lats = [r.latency_ms for r in recent_prod if r.latency_ms is not None]
+        if lats:
+            production_latency_ms = round(sum(lats) / len(lats), 1)
+
+    production_mae = None
+    if recent_labeled:
+        errors = [abs(r.prediction - r.true_label) for r in recent_labeled]
+        production_mae = sum(errors) / len(errors)
+
+    return {
+        "total_predictions": total_predictions,
+        "total_labeled": total_labeled,
+        "production_mae": production_mae,
+        "production_latency_ms": production_latency_ms,
+        "shadow_predictions": shadow_predictions,
+    }
+
+
+# --- action endpoints (dashboard buttons) --------------------------------------
+@admin.post("/upload_stream")
+def upload_stream(file: UploadFile):
+    """
+    Replaces data/stream_data.csv with an uploaded CSV - safely:
+      1. the file is read with a size cap and written to a temp file first,
+      2. it must parse as a CSV and contain every column of training_data.csv
+         plus `timestep` (`drifted` is optional; extra columns are allowed),
+         with a unique integer `timestep` and a numeric, non-empty `SalePrice`,
+      3. only then is the old file backed up (stream_data.bak.csv) and the new
+         one swapped in atomically.
+    A bad upload is rejected with a 400 and leaves the existing file untouched.
+    This only replaces the file on disk: run simulator/stream_simulator.py to
+    actually stream it to the API.
+    """
+    import pandas as pd
+
+    contents = file.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File is too large (limit {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).")
+    if not contents.strip():
+        raise HTTPException(400, "The uploaded file is empty.")
+
+    dest = DATA_DIR / "stream_data.csv"
+    backup = DATA_DIR / "stream_data.bak.csv"
+    tmp = DATA_DIR / f".stream_upload_{uuid.uuid4().hex}.tmp"
+    try:
+        tmp.write_bytes(contents)
+
+        try:
+            df = pd.read_csv(tmp)
+        except Exception as e:  # unparsable / binary / wrong encoding
+            raise HTTPException(400, f"Could not read the file as a CSV: {str(e)[:200]}")
+        if df.empty:
+            raise HTTPException(400, "The CSV has a header but no data rows.")
+
+        expected = list(pd.read_csv(TRAINING_PATH, nrows=0).columns) + ["timestep"]
+        missing = [c for c in expected if c not in df.columns]
+        if missing:
+            shown = ", ".join(missing[:8]) + (f" ... (+{len(missing) - 8} more)" if len(missing) > 8 else "")
+            raise HTTPException(
+                400, f"The CSV is missing {len(missing)} required column(s): {shown}. "
+                     f"It needs every column of training_data.csv plus 'timestep'.")
+
+        ts = pd.to_numeric(df["timestep"], errors="coerce")
+        if ts.isna().any() or (ts % 1 != 0).any():
+            raise HTTPException(400, "'timestep' must contain whole numbers with no blanks.")
+        if ts.duplicated().any():
+            raise HTTPException(400, "'timestep' values must be unique (they pair production and shadow predictions).")
+        target = pd.to_numeric(df["SalePrice"], errors="coerce")
+        if target.isna().any():
+            raise HTTPException(400, "'SalePrice' must be numeric with no blanks (it is the label sent back after each prediction).")
+
+        had_backup = False
+        if dest.exists():
+            shutil.copy2(dest, backup)
+            had_backup = True
+        os.replace(tmp, dest)  # atomic: readers see the old file or the new one, never a half-written one
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    extra = [c for c in df.columns if c not in expected and c != "drifted"]
+    return {
+        "status": "ok",
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
+        "filename": file.filename,
+        "backup": backup.name if had_backup else None,
+        "extra_columns": extra,
+    }
+
+
+@admin.post("/train_baseline")
+def train_baseline_endpoint(background_tasks: BackgroundTasks):
+    """
+    Creates the FIRST model (v1) in the background. It never overwrites an
+    existing baseline: once v1 exists, replacing what serves production only
+    happens through retrain -> shadow -> evaluation gate -> human approval.
+    """
+    if _baseline_exists():
+        raise HTTPException(
+            409, "A baseline model (v1) already exists, and this button never overwrites it. "
+                 "Use 'Retrain Challenger' to build a replacement - it goes through shadow "
+                 "testing and human approval.")
+    if not TRAIN_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "Baseline training is already running.")
+
+    def _train():
+        try:
+            from models.train_baseline import train
+            train("v1")
+            STATE["models"].pop("v1", None)
+            load_model("v1")
+        except Exception as e:
+            print(f"[train_baseline] failed: {e}")
+        finally:
+            TRAIN_LOCK.release()
+
+    background_tasks.add_task(_train)
+    return {"status": "started", "message": "Baseline training started in background. It can take about a minute."}
+
+
+@admin.post("/run_drift_check")
+def run_drift_check_endpoint():
+    """Runs the drift monitor once and returns the result."""
+    from monitor.drift_monitor import run_once
+    result = run_once(window_size=200)
+    if result is None:
+        return {"status": "skipped", "message": "Not enough data or no new predictions since last check."}
+    return {
+        "status": "ok",
+        "triggered": result["triggered"],
+        "score": result["overall_score"],
+        "n_drifted": result["n_drifted_features"],
+    }
+
+
+@admin.post("/retrain")
+def retrain_endpoint(background_tasks: BackgroundTasks):
+    """
+    Triggers challenger retraining + shadow deployment in the background.
+    Follows the same rule as the automation loop: no new retrain while a
+    challenger is already in shadow, and never two retrains at once.
+    """
+    shadow = STATE["shadow_version"]
+    if shadow:
+        raise HTTPException(
+            409, f"Challenger {shadow} is already in shadow evaluation. Let the evaluation gate "
+                 f"resolve it (and approve/reject it) before training another.")
+    if not RETRAIN_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "A retrain is already running.")
+
+    def _retrain():
+        try:
+            from retrain.retrain_pipeline import run_retrain
+            run_retrain(n_recent=500)
+        except Exception as e:
+            print(f"[retrain] failed: {e}")
+        finally:
+            RETRAIN_LOCK.release()
+
+    background_tasks.add_task(_retrain)
+    return {"status": "started", "message": "Retrain started in background. Watch /status for the new shadow version."}
+
+
+# Registered last so every route above is attached to the router first.
+app.include_router(admin)

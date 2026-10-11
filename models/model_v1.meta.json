@@ -1,0 +1,17 @@
+{
+  "log_rmse": 0.14233968648382245,
+  "rmse": 36336.57361216061,
+  "mae": 19958.36098440387,
+  "trained_at": 1791125907.8167393,
+  "n_train_rows": 700,
+  "n_features": 250,
+  "model_params": {
+    "n_estimators": 1500,
+    "learning_rate": 0.05,
+    "max_depth": 3,
+    "min_samples_leaf": 2,
+    "min_samples_split": 5,
+    "loss": "huber",
+    "random_state": 42
+  }
+}
