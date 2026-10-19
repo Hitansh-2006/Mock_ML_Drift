@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, API_URL, getAdminKey } from "../api";
+import { api, API_URL } from "../api";
 
 const POLL_MS = 5000;
 const FAST_POLL_MS = 2000;
@@ -30,10 +30,14 @@ const RESOURCES = {
  * Data from the last good response is kept on a failure (the UI dims it and
  * shows `conn.lastOkAt`), never silently replaced or presented as current.
  */
-export function useDashboard() {
+export function useDashboard(onUnauthorized) {
   const [data, setData] = useState(EMPTY);
   const [conn, setConn] = useState({ state: "loading", lastOkAt: null, message: null });
   const fastUntil = useRef(0);
+  const unauthorized = useRef(onUnauthorized);
+  useEffect(() => {
+    unauthorized.current = onUnauthorized; // always the latest callback, without re-creating `refresh`
+  });
 
   const refresh = useCallback(async () => {
     const names = Object.keys(RESOURCES);
@@ -48,7 +52,7 @@ export function useDashboard() {
     setData((prev) => ({ ...prev, ...fresh }));
 
     const network = failures.find((e) => !e.status);
-    const unauthorized = failures.find((e) => e.status === 401);
+    const rejected = failures.find((e) => e.status === 401);
     const other = failures.find((e) => e.status && e.status !== 401);
     if (network) {
       setConn((c) => ({
@@ -56,14 +60,10 @@ export function useDashboard() {
         lastOkAt: c.lastOkAt,
         message: `Could not reach the serving API at ${API_URL}. Is it running?`,
       }));
-    } else if (unauthorized) {
-      setConn((c) => ({
-        state: "locked",
-        lastOkAt: c.lastOkAt,
-        message: getAdminKey()
-          ? "The server rejected the admin key. Enter the correct one below."
-          : "This dashboard needs the admin key. Enter it below.",
-      }));
+    } else if (rejected) {
+      // The session is no longer valid (expired, revoked, server reset): back to the login page.
+      setConn((c) => ({ state: "locked", lastOkAt: c.lastOkAt, message: "Your session has ended." }));
+      unauthorized.current?.();
     } else if (other) {
       setConn((c) => ({ state: "degraded", lastOkAt: c.lastOkAt, message: other.message }));
     } else {

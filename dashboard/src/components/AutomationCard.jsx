@@ -25,7 +25,7 @@ function describeCycle(cycle) {
  * `connState`: online | offline | locked | degraded | loading. Controls only work when
  * we actually have the loop's state from the server.
  */
-export function AutomationCard({ automation, connState, busy, onStart, onStop, onRunNow }) {
+export function AutomationCard({ automation, connState, readOnlyReason, busy, onStart, onStop, onRunNow }) {
   const now = useNow(1);
   const [interval, setIntervalSeconds] = useState(60);
 
@@ -40,9 +40,10 @@ export function AutomationCard({ automation, connState, busy, onStart, onStop, o
   else if (running) pill = { tone: "success", text: "Running" };
 
   const blocked =
-    connState === "offline" ? "The serving API is not reachable."
-      : connState === "locked" ? "Enter the admin key first."
-        : !usable ? "Loading…" : undefined;
+    readOnlyReason ||
+    (connState === "offline" ? "The serving API is not reachable."
+      : connState === "locked" ? "Your session has ended. Sign in again."
+        : !usable ? "Loading…" : undefined);
 
   return (
     <Section id="automation" title="Automation" description="Checks for drift, trains a challenger and tests it silently on live traffic.">
@@ -105,7 +106,6 @@ export function AutomationCard({ automation, connState, busy, onStart, onStop, o
           </Button>
         </div>
         {connState === "offline" && <p className="note">The serving API is not reachable, so the loop's state is unknown.</p>}
-        {connState === "locked" && <p className="note">Enter the admin key above to see and control the loop.</p>}
       </div>
     </Section>
   );

@@ -3,35 +3,36 @@
 // localhost) and when deployed against a real, remote serving API.
 export const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-// The admin key is typed into the dashboard once and kept in this browser's
-// localStorage. It is deliberately NOT baked into the build: anything compiled
-// into the JavaScript bundle is readable by every visitor.
-const KEY_STORAGE = "drift_watchdog_admin_key";
+// The session token (from /auth/login or /auth/guest) is kept in this browser's
+// sessionStorage: it disappears when the tab closes and is never baked into the
+// build. The server stores only a hash of it and expires it on its own.
+const TOKEN_STORAGE = "drift_watchdog_session";
 
-export function getAdminKey() {
+export function getToken() {
   try {
-    return localStorage.getItem(KEY_STORAGE) || "";
+    return sessionStorage.getItem(TOKEN_STORAGE) || "";
   } catch {
     return "";
   }
 }
 
-export function setAdminKey(key) {
+export function setToken(token) {
   try {
-    if (key) localStorage.setItem(KEY_STORAGE, key);
-    else localStorage.removeItem(KEY_STORAGE);
+    if (token) sessionStorage.setItem(TOKEN_STORAGE, token);
+    else sessionStorage.removeItem(TOKEN_STORAGE);
   } catch {
-    /* storage unavailable (private mode etc.) - the key just won't persist */
+    /* storage unavailable (private mode etc.) - the session just won't survive a reload */
   }
 }
 
-// One request helper for everything: adds the key, and turns every failure
-// into an Error that carries the HTTP status (401 = wrong/missing key,
-// 409 = action refused because of current state, 503 = server locked).
+// One request helper for everything: adds the session token, and turns every
+// failure into an Error that carries the HTTP status (401 = not signed in or
+// session expired, 403 = read-only account, 409 = refused because of current
+// state, 429 = too many sign-in attempts, 503 = server not set up).
 async function request(method, path, { json, formData } = {}) {
   const headers = {};
-  const key = getAdminKey();
-  if (key) headers["X-API-Key"] = key;
+  const token = getToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   if (json !== undefined) headers["Content-Type"] = "application/json";
 
   const res = await fetch(`${API_URL}${path}`, {
@@ -62,6 +63,13 @@ const postFile = (path, file) => {
 };
 
 export const api = {
+  // sign-in
+  authConfig: () => get("/auth/config"),
+  login: (username, password) => post("/auth/login", { username, password }),
+  guest: () => postEmpty("/auth/guest"),
+  me: () => get("/auth/me"),
+  logout: () => postEmpty("/auth/logout"),
+
   // existing endpoints
   getStatus: () => get("/status"),
   getPredictions: (limit = 50) => get(`/admin/predictions?limit=${limit}`),

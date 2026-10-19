@@ -22,8 +22,8 @@ export function deriveHealth({ conn, driftEvents }) {
     return {
       kind: "locked",
       label: "Locked",
-      headline: "Admin key needed",
-      detail: "Enter the admin key to see drift checks, promotions and automation.",
+      headline: "Signed out",
+      detail: "Your session has ended. Sign in again to see drift checks, promotions and automation.",
     };
   }
   if (driftEvents == null) {

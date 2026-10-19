@@ -68,9 +68,10 @@ no auto-approval threshold, no timeout that promotes a model on its own.
 Two guards keep that claim true in practice:
 
 - Every `/admin/*` endpoint (including the dashboard's action buttons)
-  requires the `X-API-Key` header, and CORS only allows the dashboard's own
-  origin, so another website open in your browser can't trigger them. See
-  [Admin API key](#admin-api-key).
+  requires a signed-in session, and CORS only allows the dashboard's own
+  origin, so another website open in your browser can't trigger them. Guest
+  and read-only accounts get `403` on every route that changes anything, so
+  they can look but never approve. See [Signing in](#signing-in).
 - The **Train Baseline** button only creates the *first* model (v1) and
   refuses to overwrite one that exists. Replacing what serves production
   always goes retrain → shadow → evaluation gate → human approval.
@@ -188,21 +189,22 @@ afterward — a pattern this project's real-data generator follows too
 pip install -r requirements.txt
 python -m data.generate_dataset
 python -m models.train_baseline
-export ADMIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"   # see "Admin API key"
-uvicorn serving.app:app --reload --port 8000          # terminal 1
+cp .env.example .env     # then set ADMIN_USERNAME and ADMIN_PASSWORD (see "Signing in")
+uvicorn serving.app:app --reload --port 8000          # terminal 1 (reads .env itself)
 python simulator/stream_simulator.py --speed 0.02      # terminal 2
 ```
 Start the loop from the dashboard's **Automation** card (no third terminal needed).
-Any other terminal that runs `python -m retrain.retrain_pipeline` or the headless
-`python -m automation.loop` needs the **same** `ADMIN_API_KEY` exported.
 Run exactly **one** uvicorn worker (the default; don't pass `--workers N`).
+The headless scripts (`python -m retrain.retrain_pipeline`, `python -m automation.loop`)
+talk to the API without a login, so they need the optional machine key: set the same
+`ADMIN_API_KEY` in `.env`.
 
 ### With Postgres + full automation, via Docker Compose
 ```bash
-cp .env.example .env        # then set ADMIN_API_KEY (and optionally GROQ_API_KEY)
+cp .env.example .env        # then set ADMIN_PASSWORD (and optionally GROQ_API_KEY)
 docker compose up --build
 ```
-Compose refuses to start until `ADMIN_API_KEY` is set in `.env`.
+Compose refuses to start until `ADMIN_PASSWORD` is set in `.env`.
 This starts Postgres, the serving API (one worker) and the dashboard at
 `http://localhost:5173`. Switch the automation loop on from the dashboard's
 Automation card; it checks every 60 s by default (`CHECK_INTERVAL_SECONDS`).
@@ -222,24 +224,37 @@ docker compose --profile headless up --build
 > in (no Docker available there). Run `docker compose up --build` yourself
 > and report back anything that needs fixing.
 
-### Admin API key
+### Signing in
 
-All `/admin/*` routes need the key in an `X-API-Key` header. Set
-`ADMIN_API_KEY` in the environment of every process that talks to the admin
-API (serving, automation loop, retrain pipeline). The dashboard asks for it
-the first time you open it and remembers it in that browser.
+The dashboard opens on a login page: **username + password**, or **Continue as guest**.
 
-| Situation | What happens |
+| Who | Can do |
 |---|---|
-| Key set, request sends it | allowed |
-| Key set, header missing/wrong | `401` |
-| No key configured | `503` — the admin API stays **locked** (fails closed) |
-| `ADMIN_AUTH_DISABLED=1` | no check; for local development only |
+| `admin` account | everything, including Retrain, Automation and approving promotions |
+| `viewer` account / guest | look at everything; every `POST` under `/admin` is refused with `403` |
+
+- **First account:** put `ADMIN_USERNAME` and `ADMIN_PASSWORD` (8+ characters) in `.env`.
+  The server creates that admin on startup if it doesn't exist yet. It never overwrites
+  an existing account, so a password you changed later isn't undone by an old `.env`.
+  There is no default password.
+- **More accounts:** `python -m serving.manage_users create alice` (add `--role viewer` for a
+  read-only one); also `list`, `set-password`, `delete`.
+- **Guest:** read-only, 2-hour session, no account. Turn it off with `GUEST_LOGIN_ENABLED=0`.
+- **Safety:** passwords are stored as salted PBKDF2 hashes; five wrong attempts lock that
+  username (and that client) for 60 seconds; a wrong username and a wrong password get the
+  same answer; sessions expire (12 h, guests 2 h) and Sign out revokes them on the server.
+- **Fails closed:** with no account and no key configured, `/admin/*` returns `503` and
+  nobody (guests included) can sign in. `ADMIN_AUTH_DISABLED=1` switches checks off for
+  local development only.
+- **Optional machine key:** `ADMIN_API_KEY` is still accepted in an `X-API-Key` header, for the
+  headless scripts only. The dashboard never asks for it.
+- The server reads `.env` itself (variables already set in the environment win). The session
+  token lives in the browser tab's `sessionStorage`.
 
 `DASHBOARD_ORIGINS` (comma-separated) sets which browser origins may call the
-API; the default is the local dashboard at `http://localhost:5173`. This is a
-shared secret, not per-user login: it protects the API from other websites and
-other machines, which is what matters for a single-operator tool.
+API; the default is the local dashboard at `http://localhost:5173`. This is a small
+single-operator login, not an identity platform: it protects the API from other
+websites and other machines.
 
 ### The dashboard on its own
 ```bash
@@ -247,8 +262,8 @@ cd dashboard
 npm install
 npm run dev
 ```
-Needs the serving API running at `localhost:8000` to show anything real, and
-the admin key (it will prompt for it).
+Needs the serving API running at `localhost:8000` to show anything real, and an
+account or the guest login.
 
 ### Tests
 ```bash

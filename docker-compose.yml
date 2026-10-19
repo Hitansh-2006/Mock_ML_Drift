@@ -34,8 +34,12 @@ services:
     command: uvicorn serving.app:app --host 0.0.0.0 --port 8000 --workers 1
     environment:
       DRIFT_WATCHDOG_DB_URL: postgresql://driftwatchdog:driftwatchdog@postgres:5432/driftwatchdog
-      # Compose refuses to start if this isn't set in .env (see .env.example)
-      ADMIN_API_KEY: ${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env - see .env.example}
+      # First dashboard account. Compose refuses to start without a password (see .env.example).
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env - see .env.example}
+      GUEST_LOGIN_ENABLED: "${GUEST_LOGIN_ENABLED:-1}"
+      # Optional machine key, only needed for the headless profile below.
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       DASHBOARD_ORIGINS: ${DASHBOARD_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       # Used by the in-process automation loop (the dashboard's Automation card):
       CHECK_INTERVAL_SECONDS: "${CHECK_INTERVAL_SECONDS:-60}"
@@ -63,7 +67,8 @@ services:
       DRIFT_WATCHDOG_DB_URL: postgresql://driftwatchdog:driftwatchdog@postgres:5432/driftwatchdog
       SERVING_API_URL: http://serving:8000
       CHECK_INTERVAL_SECONDS: "60"
-      ADMIN_API_KEY: ${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env - see .env.example}
+      # The headless loop has no login: it needs the same ADMIN_API_KEY as `serving` (set it in .env).
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
     volumes:
       - ./models:/app/models
