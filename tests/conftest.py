@@ -10,6 +10,10 @@ import pytest
 
 _tmp = tempfile.mkdtemp(prefix="drift_watchdog_tests_")
 os.environ["DRIFT_WATCHDOG_DB_URL"] = f"sqlite:///{_tmp}/test.db"
+os.environ["DRIFT_WATCHDOG_NO_DOTENV"] = "1"       # tests must not pick up the developer's real .env
+os.environ["PASSWORD_HASH_ITERATIONS"] = "1000"    # fast hashing; production default is much higher
+for _name in ("ADMIN_USERNAME", "ADMIN_PASSWORD", "GUEST_LOGIN_ENABLED"):
+    os.environ.pop(_name, None)
 os.environ["ADMIN_API_KEY"] = "test-key-123"
 
 ROOT = Path(__file__).resolve().parent.parent

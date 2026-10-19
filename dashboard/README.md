@@ -7,8 +7,10 @@ predictions. Light and dark themes. No UI or charting library: the two charts
 (drift-score sparkline, production-vs-challenger bar) are small inline SVGs.
 
 It talks to the serving API at `VITE_API_URL` (default `http://localhost:8000`)
-and asks for the admin key the first time (kept in this browser's localStorage,
-never in the bundle).
+and opens on a login page: username + password, or "Continue as guest" (read-only).
+The session token is kept in the tab's sessionStorage, never in the bundle. Guests and
+read-only accounts see everything, but every action is disabled in the UI and refused
+by the server (`403`).
 
 ## Run it
 
@@ -32,7 +34,7 @@ refreshes immediately after every action.
 | State | When |
 |---|---|
 | **Offline** (grey, "last updated hh:mm") | the API can't be reached; last data stays on screen, dimmed |
-| **Locked** | the admin key is missing/wrong (401) |
+| **Locked** | the session has ended (401); the app returns to the login page |
 | **Waiting for data** | reachable, but no drift check has ever run |
 | **Normal** | only when the most recent real check did not trigger |
 | **Drift detected** | the most recent check triggered |
@@ -42,7 +44,10 @@ does not record which, so the UI doesn't claim "AI".
 
 ## Structure
 
-- `src/api.js` - the one request helper (adds the key, turns failures into errors with an HTTP status)
+- `src/api.js` - the one request helper (adds the session token, turns failures into errors with an HTTP status)
+- `src/App.jsx` - the sign-in gate; `src/Console.jsx` - the dashboard itself, mounted only after login
+- `src/hooks/useAuth.js` - session state (login, guest, sign out, restoring a saved session)
+- `src/components/LoginPage.jsx` - the login page (animated "drift" illustration, show/hide password, caps-lock hint, lockout messages)
 - `src/hooks/useDashboard.js` - polling + connection state (`online | offline | locked | degraded`); keeps stale data
 - `src/hooks/useNow.js` - one shared timer for relative times and the countdown
 - `src/lib/format.js`, `src/lib/health.js` - number/time formatting; the status decision

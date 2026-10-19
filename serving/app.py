@@ -24,17 +24,17 @@ from typing import Optional
 
 import joblib
 import numpy as np
-from fastapi import APIRouter, FastAPI, Depends, HTTPException, UploadFile, BackgroundTasks
+from fastapi import APIRouter, FastAPI, Depends, Header, HTTPException, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from automation.controller import AutomationController, MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS
 from automation.loop import CycleDeps
-from serving import registry
+from serving import auth, registry
 from serving.db import init_db, get_session, SessionLocal, PredictionLog, PromotionRequest, DriftEvent
 from data.house_price_preprocessor import HousePricePreprocessor
-from serving.security import require_admin, auth_mode
+from serving.security import require_admin, auth_mode, current_principal, guest_enabled, is_configured
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT_DIR / "models"
@@ -76,7 +76,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=DASHBOARD_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
 
 # --- in-memory cache of the DB model registry ---------------------------------
@@ -169,10 +169,18 @@ def startup():
     except FileNotFoundError as e:
         print(f"[startup] WARNING: {e}. /predict will return 503 until a baseline model "
               f"exists (dashboard: Train Baseline, or `python -m models.train_baseline`).")
-    mode = auth_mode()
+    db = SessionLocal()
+    try:
+        seeded = auth.seed_admin_from_env(db)
+        if seeded:
+            print(f"[startup] {seeded}")
+        mode = auth_mode(db)
+    finally:
+        db.close()
     if mode == "locked":
-        print("[startup] WARNING: ADMIN_API_KEY is not set - the /admin API is LOCKED (503). "
-              "Set ADMIN_API_KEY, or ADMIN_AUTH_DISABLED=1 for local development only.")
+        print("[startup] WARNING: no account and no ADMIN_API_KEY - the /admin API is LOCKED (503). "
+              "Set ADMIN_USERNAME + ADMIN_PASSWORD in .env (or run `python -m serving.manage_users create`), "
+              "or ADMIN_AUTH_DISABLED=1 for local development only.")
     elif mode == "disabled":
         print("[startup] WARNING: ADMIN_AUTH_DISABLED=1 - /admin endpoints are UNPROTECTED. Local dev only.")
 
@@ -305,8 +313,71 @@ def _baseline_exists() -> bool:
     )
 
 
-# Every /admin/* route below hangs off this router, so the API-key check is
-# applied in exactly one place and can't be forgotten on a new endpoint.
+# --- sign-in (public by design: it is how you obtain a session) ------------------
+auth_router = APIRouter(prefix="/auth")
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=512)
+
+
+def _require_configured(db: Session):
+    if not is_configured(db):
+        raise HTTPException(503, "Sign-in is not set up: no account exists. "
+                                 "Set ADMIN_USERNAME and ADMIN_PASSWORD (see .env.example) and restart.")
+
+
+@auth_router.get("/config")
+def auth_config(db: Session = Depends(get_session)):
+    """What the login page needs to know before anyone has signed in."""
+    return {"configured": is_configured(db), "guest_enabled": guest_enabled()}
+
+
+@auth_router.post("/login")
+def login(req: LoginRequest, request: Request, db: Session = Depends(get_session)):
+    _require_configured(db)
+    client = request.client.host if request.client else "unknown"
+    wait = auth.retry_after(req.username, client)
+    if wait:
+        raise HTTPException(429, f"Too many failed attempts. Try again in {wait} seconds.",
+                            headers={"Retry-After": str(wait)})
+    user = auth.authenticate(db, req.username, req.password)
+    if user is None:
+        auth.record_failure(req.username, client)
+        raise HTTPException(401, "Invalid username or password.")  # same answer for unknown user and wrong password
+    auth.record_success(req.username, client)
+    return auth.create_session(db, user.username, user.role)
+
+
+@auth_router.post("/guest")
+def guest_login(db: Session = Depends(get_session)):
+    """A read-only session with no account. Disable with GUEST_LOGIN_ENABLED=0."""
+    if not guest_enabled():
+        raise HTTPException(403, "Guest access is turned off on this server.")
+    _require_configured(db)
+    return auth.create_session(db, "guest", "viewer", guest=True)
+
+
+@auth_router.post("/logout")
+def logout(authorization: Optional[str] = Header(default=None), db: Session = Depends(get_session)):
+    if authorization and authorization[:7].lower() == "bearer ":
+        auth.revoke_session(db, authorization[7:].strip())
+    return {"status": "ok"}
+
+
+@auth_router.get("/me")
+def me(x_api_key: Optional[str] = Header(default=None), authorization: Optional[str] = Header(default=None),
+       db: Session = Depends(get_session)):
+    principal = current_principal(db, x_api_key, authorization)
+    if principal is None:
+        raise HTTPException(401, "Not signed in.", headers={"WWW-Authenticate": "Bearer"})
+    return {"username": principal.username, "role": principal.role, "guest": principal.guest}
+
+
+# Every /admin/* route below hangs off this router, so the credential check and the
+# read-only rule for viewers/guests are applied in exactly one place (security.require_admin)
+# and can't be forgotten on a new endpoint.
 admin = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
 
@@ -689,3 +760,4 @@ def automation_run_now():
 
 # Registered last so every route above is attached to the router first.
 app.include_router(admin)
+app.include_router(auth_router)

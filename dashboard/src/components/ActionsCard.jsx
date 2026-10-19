@@ -5,14 +5,15 @@ import { Button } from "./ui";
  * Quick actions. Every button states WHY it is disabled (tooltip on hover and
  * keyboard focus) and shows a spinner while its work is in flight.
  */
-export function ActionsCard({ status, connState, busy, trainingBaseline, onUpload, onTrainBaseline, onDriftCheck, onRetrain }) {
+export function ActionsCard({ status, connState, readOnlyReason, busy, trainingBaseline, onUpload, onTrainBaseline, onDriftCheck, onRetrain }) {
   const fileRef = useRef(null);
 
   const blocked =
-    connState === "offline" ? "The serving API is not reachable."
-      : connState === "locked" ? "Enter the admin key first."
+    readOnlyReason ||
+    (connState === "offline" ? "The serving API is not reachable."
+      : connState === "locked" ? "Your session has ended. Sign in again."
         : connState === "loading" ? "Connecting…"
-          : null;
+          : null);
   const baselineReady = !!status?.baseline_ready;
   const shadow = status?.shadow_version;
   const anyBusy = !!busy || trainingBaseline;

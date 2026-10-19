@@ -1,36 +1,40 @@
 """
-Admin API protection.
+Who may call /admin/*, and what each kind of caller may do. This is the ONE place
+that decides it: every /admin route hangs off the `admin` router in serving/app.py,
+which depends on `require_admin` below, so a new route cannot forget the check.
 
-Every /admin/* endpoint (dashboard buttons, set_shadow, promote, ...) requires
-an API key sent in the `X-API-Key` header. Configure it with environment
-variables on every process that talks to the admin API (serving, automation
-loop, retrain pipeline):
+Credentials (any one is enough):
+  - a session: `Authorization: Bearer <token>` from POST /auth/login or /auth/guest
+  - the optional machine key: `X-API-Key: <ADMIN_API_KEY>`, for this project's own
+    scripts (headless retrain / automation loop). The dashboard doesn't use it.
 
-    ADMIN_API_KEY=<long random string>     the key (required in normal use)
-    ADMIN_AUTH_DISABLED=1                  explicit opt-out for local dev ONLY
+What a caller may do:
+  - role `admin` (a signed-in admin, or the machine key): everything
+  - role `viewer` (a read-only account or a guest): GET only. Every other method is
+    refused with 403, so nothing a viewer does can change production (invariant I1).
 
 Behaviour:
-  - key set            -> requests must send a matching X-API-Key, else 401
-  - key unset, no opt-out -> admin API is locked: 503 with instructions
-    (fails closed, so forgetting to configure it never leaves the API open)
-  - ADMIN_AUTH_DISABLED=1 -> no check (local development only)
+  - valid credentials              -> allowed (viewers only for GET)
+  - none / invalid                 -> 401
+  - nothing configured at all      -> 503 (fails closed: no ADMIN_API_KEY and no accounts)
+  - ADMIN_AUTH_DISABLED=1 with no key -> no check (local development only)
 
-Why a custom header matters: browsers only send non-standard headers
-cross-site after a CORS preflight, and the CORS policy in serving/app.py only
-allows the dashboard's origin. So another website open in your browser can't
-trigger these endpoints even though the API is on localhost.
-
-Note this protects the API from other sites and other machines; it is a
-shared secret, not per-user login.
+Note this protects the API from other sites and other machines; it is a small
+single-operator login, not an identity platform.
 """
 import os
 import secrets
 from typing import Optional
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
+from sqlalchemy.orm import Session
+
+from serving import auth
+from serving.db import get_session
 
 # Values from .env.example that must never be accepted as a real key.
 PLACEHOLDER_KEYS = {"", "change-me", "changeme", "your_admin_api_key_here"}
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
 def _configured_key() -> Optional[str]:
@@ -38,31 +42,74 @@ def _configured_key() -> Optional[str]:
     return None if key.lower() in PLACEHOLDER_KEYS else key
 
 
-def auth_mode() -> str:
-    """'key' | 'disabled' | 'locked' — used for the startup log line."""
-    if _configured_key():
+def _auth_disabled() -> bool:
+    return os.environ.get("ADMIN_AUTH_DISABLED") == "1"
+
+
+def guest_enabled() -> bool:
+    return os.environ.get("GUEST_LOGIN_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def is_configured(db: Session) -> bool:
+    """True once there is at least one way to sign in (an account or the machine key)."""
+    return bool(_configured_key()) or auth.has_users(db)
+
+
+def auth_mode(db: Optional[Session] = None) -> str:
+    """'accounts' | 'key' | 'both' | 'disabled' | 'locked' - for the startup log line."""
+    key = bool(_configured_key())
+    accounts = auth.has_users(db) if db is not None else False
+    if key and accounts:
+        return "both"
+    if accounts:
+        return "accounts"
+    if key:
         return "key"
-    if os.environ.get("ADMIN_AUTH_DISABLED") == "1":
-        return "disabled"
-    return "locked"
+    return "disabled" if _auth_disabled() else "locked"
 
 
-def require_admin(x_api_key: Optional[str] = Header(default=None)) -> None:
-    """FastAPI dependency applied to the whole /admin router."""
+def _bearer(authorization: Optional[str]) -> Optional[str]:
+    if authorization and authorization[:7].lower() == "bearer ":
+        return authorization[7:].strip() or None
+    return None
+
+
+def current_principal(db: Session, x_api_key: Optional[str], authorization: Optional[str]) -> Optional[auth.Principal]:
     expected = _configured_key()
-    if expected:
-        if not x_api_key or not secrets.compare_digest(
-            x_api_key.encode("utf-8"), expected.encode("utf-8")
-        ):
-            raise HTTPException(401, "Invalid or missing admin API key (send it in the X-API-Key header).")
-        return
-    if os.environ.get("ADMIN_AUTH_DISABLED") == "1":
-        return
-    raise HTTPException(
-        503,
-        "Admin API is locked: no ADMIN_API_KEY is configured on the server. "
-        "Set ADMIN_API_KEY (or ADMIN_AUTH_DISABLED=1 for local development only) and restart.",
-    )
+    if expected and x_api_key and secrets.compare_digest(x_api_key.encode("utf-8"), expected.encode("utf-8")):
+        return auth.Principal(username="api-key", role="admin", via="api_key")
+    token = _bearer(authorization)
+    if token:
+        return auth.principal_for_token(db, token)
+    return None
+
+
+def require_admin(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_session),
+) -> auth.Principal:
+    """FastAPI dependency applied to the whole /admin router."""
+    principal = current_principal(db, x_api_key, authorization)
+
+    if principal is None:
+        if _auth_disabled() and not _configured_key():
+            principal = auth.Principal(username="dev", role="admin", via="dev")
+        elif not is_configured(db):
+            raise HTTPException(
+                503,
+                "Admin API is locked: no account or ADMIN_API_KEY is configured on the server. "
+                "Set ADMIN_USERNAME and ADMIN_PASSWORD (or run `python -m serving.manage_users create`), "
+                "or ADMIN_AUTH_DISABLED=1 for local development only, and restart.",
+            )
+        else:
+            raise HTTPException(401, "Sign in required (missing, invalid or expired session).",
+                                headers={"WWW-Authenticate": "Bearer"})
+
+    if principal.role != "admin" and request.method not in SAFE_METHODS:
+        raise HTTPException(403, "This account is read-only. Sign in with an admin account to make changes.")
+    return principal
 
 
 def admin_headers() -> dict:

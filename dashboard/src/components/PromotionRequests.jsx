@@ -42,11 +42,11 @@ function PendingCard({ r, busyId, blocked, onDecide }) {
   );
 }
 
-export function PromotionRequests({ requests, busyId, connState, onDecide }) {
+export function PromotionRequests({ requests, busyId, connState, readOnlyReason, onDecide }) {
   const loading = requests == null;
   const pending = (requests || []).filter((r) => r.status === "pending");
   const decided = (requests || []).filter((r) => r.status !== "pending");
-  const blocked = connState === "offline" ? "The serving API is not reachable." : connState === "locked" ? "Enter the admin key first." : undefined;
+  const blocked = readOnlyReason || (connState === "offline" ? "The serving API is not reachable." : connState === "locked" ? "Your session has ended. Sign in again." : undefined);
 
   return (
     <Section

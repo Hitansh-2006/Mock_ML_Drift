@@ -6,6 +6,8 @@ code is unchanged since it's all through SQLAlchemy.
 """
 import os
 import time
+
+from serving import config  # noqa: F401  (loads .env before any setting below is read)
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String, Boolean, JSON, DateTime, Index, text
 )
@@ -105,6 +107,28 @@ class ModelRegistry(Base):
         Index("uq_model_registry_one_shadow", "role", unique=True,
               sqlite_where=text("role = 'shadow'"), postgresql_where=text("role = 'shadow'")),
     )
+
+
+class User(Base):
+    """A dashboard account. Passwords are only ever stored as salted PBKDF2 hashes."""
+    __tablename__ = "users"
+
+    username = Column(String, primary_key=True)   # stored lower-case
+    password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False)          # admin | viewer (read-only)
+    created_at = Column(Float, default=time.time)
+
+
+class AuthSession(Base):
+    """A login session. Only the SHA-256 of the bearer token is stored, so a DB leak is not a session leak."""
+    __tablename__ = "auth_sessions"
+
+    token_hash = Column(String, primary_key=True)
+    username = Column(String, nullable=False)
+    role = Column(String, nullable=False)
+    is_guest = Column(Boolean, default=False, nullable=False)
+    created_at = Column(Float, default=time.time)
+    expires_at = Column(Float, nullable=False, index=True)
 
 
 class AutomationState(Base):
