@@ -15,6 +15,12 @@ export function formatMs(value) {
   return value == null ? MISSING : `${value.toFixed(1)} ms`;
 }
 
+/** "5.2 ms (p95 9.1 ms)": the median inference latency and the slow tail. */
+export function formatLatency(p50, p95) {
+  if (p50 == null) return MISSING;
+  return p95 == null ? formatMs(p50) : `${formatMs(p50)} (p95 ${formatMs(p95)})`;
+}
+
 export function formatPercent(fraction, digits = 1) {
   return fraction == null ? MISSING : `${(fraction * 100).toFixed(digits)}%`;
 }

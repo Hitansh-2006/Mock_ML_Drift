@@ -51,7 +51,8 @@ def cmd_logs(limit):
         print(f"{'id':>5} {'ts':>5} {'model':>7} {'shadow':>7} {'prediction':>12} {'true_label':>12}")
         for r in reversed(rows):
             label = f"{r.true_label:.2f}" if r.true_label is not None else "-"
-            print(f"{r.id:>5} {r.timestep:>5} {r.model_version:>7} {str(r.is_shadow):>7} "
+            timestep = "-" if r.timestep is None else r.timestep   # timestep is optional metadata
+            print(f"{r.id:>5} {timestep:>5} {r.model_version:>7} {str(r.is_shadow):>7} "
                   f"{r.prediction:>12.2f} {label:>12}")
     finally:
         db.close()

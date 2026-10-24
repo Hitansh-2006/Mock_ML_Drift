@@ -44,7 +44,9 @@ export function RecentPredictions({ predictions }) {
                   <td className="num mono">{formatMoney(p.prediction)}</td>
                   <td className="num mono">{p.true_label != null ? formatMoney(p.true_label) : <span className="muted">pending</span>}</td>
                   <td className="num mono">{p.true_label != null ? formatMoney(Math.abs(p.prediction - p.true_label)) : "—"}</td>
-                  <td className="num mono">{formatMs(p.latency_ms)}</td>
+                  <td className="num mono" title={p.latency_ms == null ? "Warm-up request: not timed, so it can't skew the latency numbers" : "Inference time only (no network, no model loading)"}>
+                    {formatMs(p.latency_ms)}
+                  </td>
                 </tr>
               ))}
             </tbody>

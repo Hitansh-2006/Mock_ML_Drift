@@ -1,0 +1,53 @@
+# What must NOT end up inside the Python image (invariant I9). `COPY . .` in the
+# Dockerfile copies the whole build context, so anything not listed here is baked in.
+
+# Version control and CI: the history is not needed to run, and may hold old secrets
+.git
+.github
+
+# NOTE: Docker matches a bare pattern like `*.db` against the context ROOT only, so the
+# `**/` lines below are what catch nested copies (e.g. dashboard/.env, data/x.db).
+
+# Secrets: compose passes configuration as environment variables instead
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Local databases (they hold accounts and password hashes)
+*.db
+*.sqlite
+*.sqlite3
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+
+# Generated model artifacts for v2 and above come from retraining and live in the
+# mounted models/ volume; the v1 baseline (models/*_v1.*) stays in the image
+models/*_v[2-9]*
+models/*_v[1-9][0-9]*
+models/.reserve_v*
+models/reference_*.parquet
+
+# Scratch files written by the dashboard's upload button
+data/stream_data.bak.csv
+data/.stream_upload_*
+
+# Local tooling and build output
+.venv
+venv
+node_modules
+**/node_modules
+dashboard/node_modules
+dashboard/dist
+__pycache__
+**/__pycache__
+.pytest_cache
+**/.pytest_cache
+*.log
+**/*.log
+
+# The old extracted copy of the project
+proj

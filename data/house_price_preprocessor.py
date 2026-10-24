@@ -88,14 +88,19 @@ class HousePricePreprocessor:
         df["Electrical"] = df["Electrical"].fillna(self.electrical_mode_)
         df["GarageYrBlt"] = df["GarageYrBlt"].fillna(0)
 
-        df["LotFrontage"] = df.apply(
-            lambda row: self.neighborhood_lotfrontage_medians_.get(
-                row["Neighborhood"], self.neighborhood_lotfrontage_medians_.median()
-            )
-            if pd.isna(row["LotFrontage"])
-            else row["LotFrontage"],
-            axis=1,
-        )
+        # A neighbourhood's median is itself NaN when LotFrontage is missing for EVERY row of it in
+        # the fitting data (easy in a small retraining sample); fall back to the overall median
+        # rather than letting NaN reach the integer cast and crash the whole retrain.
+        overall = self.neighborhood_lotfrontage_medians_.median()
+        overall = 0.0 if pd.isna(overall) else overall
+
+        def fill_lot_frontage(row):
+            if not pd.isna(row["LotFrontage"]):
+                return row["LotFrontage"]
+            value = self.neighborhood_lotfrontage_medians_.get(row["Neighborhood"], overall)
+            return overall if pd.isna(value) else value
+
+        df["LotFrontage"] = df.apply(fill_lot_frontage, axis=1)
 
         for col in EXTRA_CATEGORICAL_FILL:
             if col in df.columns:

@@ -1,7 +1,7 @@
 import { formatInt, formatMoney, formatMs, formatScore } from "../lib/format";
 import { RelativeTime, Skeleton } from "./ui";
 
-function Kpi({ label, loading, value, sub }) {
+function Kpi({ label, loading, value, sub, tone }) {
   return (
     <div className="card kpi" aria-busy={loading || undefined}>
       <div className="card-title">{label}</div>
@@ -12,7 +12,7 @@ function Kpi({ label, loading, value, sub }) {
         </>
       ) : (
         <>
-          <div className="kpi-value">{value}</div>
+          <div className="kpi-value" data-tone={tone || undefined}>{value}</div>
           <div className="kpi-sub">{sub}</div>
         </>
       )}
@@ -21,6 +21,23 @@ function Kpi({ label, loading, value, sub }) {
 }
 
 const NA = <span className="kpi-note">Unavailable</span>;
+
+/**
+ * How bad is the live error? Judged against what THIS model scored on its own validation split
+ * (no house-price constants); the warn/alert ratios come from the server's config.
+ * Returns null when there is nothing to compare.
+ */
+function judgeError(stats) {
+  if (!stats || stats.production_mae == null || !stats.expected_mae) return null;
+  const ratio = stats.production_mae / stats.expected_mae;
+  const tone = ratio >= stats.mae_alert_ratio ? "danger" : ratio >= stats.mae_warn_ratio ? "warning" : "success";
+  return { ratio, tone };
+}
+
+function latencyText(stats) {
+  if (stats.production_latency_ms == null) return "inference not timed yet";
+  return `inference p50 ${formatMs(stats.production_latency_ms)}, p95 ${formatMs(stats.production_latency_p95_ms)}`;
+}
 
 /**
  * `unavailable` = we are not loading any more but have nothing (offline or
@@ -46,10 +63,20 @@ export function KpiStrip({ status, stats, latestDrift, driftLoaded, unavailable 
         sub={stats ? `${formatInt(stats.total_labeled)} labelled so far` : "—"}
       />
       <Kpi
-        label="Error (MAE)"
+        label={stats?.production_version ? `Error (MAE) · ${stats.production_version}` : "Error (MAE)"}
         loading={statsLoading}
+        tone={judgeError(stats)?.tone}
         value={!stats ? NA : noLabels ? <span className="kpi-note">No labels yet</span> : formatMoney(stats.production_mae)}
-        sub={!stats ? "—" : noLabels ? "Labels arrive after a delay" : `Recent labelled · inference ${formatMs(stats.production_latency_ms)}`}
+        sub={
+          !stats ? "—"
+            : noLabels ? `Labels arrive after a delay · ${latencyText(stats)}`
+              : <>
+                {judgeError(stats)
+                  ? `${judgeError(stats).ratio.toFixed(1)}× its validation error (${formatMoney(stats.expected_mae)})`
+                  : `last ${stats.production_mae_n} labelled`}
+                {" · "}{latencyText(stats)}
+              </>
+        }
       />
       <Kpi
         label="Latest drift score"

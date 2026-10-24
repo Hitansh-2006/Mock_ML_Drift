@@ -35,7 +35,10 @@ class PredictionLog(Base):
     model_version = Column(String, nullable=False, index=True)
     is_shadow = Column(Boolean, default=False, index=True)   # shadow model prediction, not served
     true_label = Column(Float, nullable=True)                 # filled in later when label arrives
-    latency_ms = Column(Float, nullable=True)                 # inference time in milliseconds
+    latency_ms = Column(Float, nullable=True)                 # inference-only time in ms; NULL for warm-up calls
+    # One id per /predict call, shared by the production row and its shadow twin. This (not the
+    # optional `timestep`) is how rows are paired, labelled and compared. NULL on legacy rows.
+    request_id = Column(String, index=True, nullable=True)
     served_at = Column(Float, default=time.time)
 
 
@@ -56,6 +59,11 @@ class DriftEvent(Base):
     triggered = Column(Boolean, default=False)
     details = Column(JSON, nullable=True)
     explanation = Column(String, nullable=True)  # optional LLM-generated plain-English summary
+    # The window is identified by prediction_logs ids, because timesteps are optional.
+    window_start_log_id = Column(Integer, nullable=True)
+    window_end_log_id = Column(Integer, nullable=True)
+    # Whose training data this window was compared against (the production model's, FR-2).
+    reference_version = Column(String, nullable=True)
 
 
 class PromotionRequest(Base):
@@ -73,8 +81,11 @@ class PromotionRequest(Base):
     created_at = Column(Float, default=time.time)
     challenger_mae = Column(Float, nullable=True)
     production_mae = Column(Float, nullable=True)
-    challenger_latency_ms = Column(Float, nullable=True)     # challenger inference latency in ms
-    production_latency_ms = Column(Float, nullable=True)     # production inference latency in ms
+    # Inference latency over the paired requests: p50 (median) in *_latency_ms, p95 in *_p95_ms.
+    challenger_latency_ms = Column(Float, nullable=True)
+    production_latency_ms = Column(Float, nullable=True)
+    challenger_latency_p95_ms = Column(Float, nullable=True)
+    production_latency_p95_ms = Column(Float, nullable=True)
     n_labels_compared = Column(Integer, nullable=True)
     status = Column(String, default="pending")  # pending | approved | rejected | withdrawn
     decided_at = Column(Float, nullable=True)
@@ -146,21 +157,52 @@ class AutomationState(Base):
     last_cycle = Column(JSON, nullable=True)
 
 
+# Columns added after the first release. `create_all` only creates MISSING TABLES, never
+# missing columns, so a database from an older version needs these added in place.
+ADDITIVE_COLUMNS = [
+    ("prediction_logs", "latency_ms", "FLOAT"),
+    ("prediction_logs", "request_id", "VARCHAR"),
+    ("drift_events", "explanation", "VARCHAR"),
+    ("drift_events", "window_start_log_id", "INTEGER"),
+    ("drift_events", "window_end_log_id", "INTEGER"),
+    ("drift_events", "reference_version", "VARCHAR"),
+    ("promotion_requests", "explanation", "VARCHAR"),
+    ("promotion_requests", "challenger_latency_ms", "FLOAT"),
+    ("promotion_requests", "production_latency_ms", "FLOAT"),
+    ("promotion_requests", "challenger_latency_p95_ms", "FLOAT"),
+    ("promotion_requests", "production_latency_p95_ms", "FLOAT"),
+]
+ADDITIVE_INDEXES = [
+    ("ix_prediction_logs_request_id", "prediction_logs", "request_id"),
+]
+
+
+def migrate(bind=None):
+    """
+    Bring an existing database up to the current schema. Safe to run on every start, on
+    SQLite and Postgres: it INSPECTS what is there and only adds what is missing, each change
+    in its own transaction, so one failure can't leave a Postgres transaction aborted and
+    silently break the changes after it (the old "try ALTER, ignore errors" loop did).
+    """
+    from sqlalchemy import inspect, text
+    bind = bind or engine
+    Base.metadata.create_all(bind=bind)
+    existing = {}
+    inspector = inspect(bind)
+    for table, column, sql_type in ADDITIVE_COLUMNS:
+        if table not in existing:
+            existing[table] = {c["name"] for c in inspector.get_columns(table)}
+        if column not in existing[table]:
+            with bind.begin() as conn:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
+            existing[table].add(column)
+    for name, table, column in ADDITIVE_INDEXES:
+        with bind.begin() as conn:
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
+
+
 def init_db():
-    Base.metadata.create_all(bind=engine)
-    # Ensure newly added columns exist in existing SQLite or Postgres tables
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        for stmt in [
-            "ALTER TABLE prediction_logs ADD COLUMN latency_ms FLOAT",
-            "ALTER TABLE promotion_requests ADD COLUMN challenger_latency_ms FLOAT",
-            "ALTER TABLE promotion_requests ADD COLUMN production_latency_ms FLOAT",
-        ]:
-            try:
-                conn.execute(text(stmt))
-                conn.commit()
-            except Exception:
-                pass  # column already exists or table freshly created
+    migrate(engine)
 
 
 def get_session():

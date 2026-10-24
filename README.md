@@ -132,6 +132,32 @@ that passes the gate only creates a `pending` promotion request.
   running API over HTTP) or, in Docker, `docker compose --profile headless up`. Do not
   run it *and* the dashboard loop at once: the in-process lock cannot see another process.
 
+## How the loop measures things
+
+- **Pairing is by request, not by timestep.** Every `/predict` returns a `request_id`; the
+  shadow model's row shares it. `/label` back-fills the shadow row(s) with that id, and the
+  evaluation gate compares production and challenger on exactly the same requests.
+  `timestep` is optional metadata: real traffic has none, and replaying a stream can't mix
+  up two different shadow models any more. (Rows logged before this existed have no id and
+  are ignored by the gate.)
+- **Drift is measured against the model that is serving.** Every model saves
+  `models/reference_<version>.parquet` (the monitored features and the target of its own
+  training rows). The drift monitor compares the latest window with the *current
+  production* model's snapshot and records which version it used, so after you promote a
+  challenger trained on the new regime the same traffic is no longer "drift" and the loop
+  stops retraining for nothing. v1's snapshot is created from `data/training_data.csv` on
+  demand; a model trained before snapshots existed falls back to v1's and the check says so.
+- **Latency means inference only.** The timer starts after the model is loaded (a cold disk
+  read is never counted), the first `LATENCY_WARMUP_CALLS` (3) requests of a freshly loaded
+  model are scored but not timed, and everything is reported as **p50 and p95**, not a mean
+  that one outlier can distort. Latency is shown to you; it does not decide the gate.
+- **Stats describe the model in production now.** `/admin/stats` reports the MAE of the current
+  production version only (null until it has labelled rows), the model's own validation
+  error (`expected_mae`, from its meta file) and the warn/alert ratios the dashboard uses to
+  colour the number: `MAE_WARN_RATIO` (default 1.3) and `MAE_ALERT_RATIO` (default 2.0).
+- Existing databases are upgraded in place on start (`serving/db.py: migrate`): it inspects
+  what is missing and adds only that, one transaction per change.
+
 ## Data
 
 Uses the real **Kaggle House Prices — Advanced Regression Techniques**

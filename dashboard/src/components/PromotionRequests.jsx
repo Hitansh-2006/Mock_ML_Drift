@@ -1,4 +1,4 @@
-import { formatInt, formatMoney, formatMs, formatPercent, improvement } from "../lib/format";
+import { formatInt, formatLatency, formatMoney, formatPercent, improvement } from "../lib/format";
 import { Badge, Button, EmptyState, RelativeTime, Section, Skeleton, Summary, TableCaption } from "./ui";
 import { CompareBar } from "./CompareBar";
 
@@ -24,8 +24,8 @@ function PendingCard({ r, busyId, blocked, onDecide }) {
       <div className="metrics">
         <div className="metric"><div className="metric-label">Paired samples</div><div className="metric-value">{formatInt(r.n_labels_compared)}</div></div>
         <div className="metric"><div className="metric-label">Error reduction</div><div className={`metric-value ${gain > 0 ? "good" : ""}`}>{formatPercent(gain)}</div></div>
-        <div className="metric"><div className="metric-label">Prod latency</div><div className="metric-value">{formatMs(r.production_latency_ms)}</div></div>
-        <div className="metric"><div className="metric-label">Challenger latency</div><div className="metric-value">{formatMs(r.challenger_latency_ms)}</div></div>
+        <div className="metric"><div className="metric-label">Prod inference p50 / p95</div><div className="metric-value metric-small">{formatLatency(r.production_latency_ms, r.production_latency_p95_ms)}</div></div>
+        <div className="metric"><div className="metric-label">Challenger inference p50 / p95</div><div className="metric-value metric-small">{formatLatency(r.challenger_latency_ms, r.challenger_latency_p95_ms)}</div></div>
       </div>
 
       {r.explanation && <Summary>{r.explanation}</Summary>}
@@ -79,6 +79,7 @@ export function PromotionRequests({ requests, busyId, connState, readOnlyReason,
                     <th scope="col" className="num">Production MAE</th>
                     <th scope="col" className="num">Samples</th>
                     <th scope="col">Status</th>
+                    <th scope="col">Decided by</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -92,6 +93,9 @@ export function PromotionRequests({ requests, busyId, connState, readOnlyReason,
                       <td className="num mono">{formatMoney(r.production_mae)}</td>
                       <td className="num mono">{formatInt(r.n_labels_compared)}</td>
                       <td><Badge tone={STATUS_TONE[r.status] || "neutral"}>{r.status}</Badge></td>
+                      <td>
+                        {r.decided_by ? <><span className="mono">{r.decided_by}</span> <span className="muted">· <RelativeTime ts={r.decided_at} /></span></> : <span className="muted">—</span>}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

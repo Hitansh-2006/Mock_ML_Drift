@@ -3,6 +3,13 @@ import { formatScore } from "../lib/format";
 import { Badge, EmptyState, RelativeTime, Section, Skeleton, Summary, TableCaption } from "./ui";
 import { Sparkline } from "./Sparkline";
 
+/** Timesteps are optional, so a window is described by the request ids it covers (and timesteps when present). */
+function windowLabel(e) {
+  const ids = e.window_end_log_id != null ? `#${e.window_start_log_id}–#${e.window_end_log_id}` : null;
+  const steps = e.window_end_timestep != null ? `t ${e.window_start_timestep}–${e.window_end_timestep}` : null;
+  return [ids, steps].filter(Boolean).join(" · ") || "—";
+}
+
 function SkeletonRows({ cols }) {
   return Array.from({ length: 3 }, (_, r) => (
     <tr key={r}>{Array.from({ length: cols }, (_, c) => <td key={c}><Skeleton width="70%" /></td>)}</tr>
@@ -24,7 +31,7 @@ export function DriftMonitor({ events }) {
       description="Each check runs a KS test per monitored feature, live requests against the training data. Two or more features drifting significantly triggers an alert."
     >
       {loading ? (
-        <div className="table-wrap" aria-busy="true"><table><tbody><SkeletonRows cols={4} /></tbody></table></div>
+        <div className="table-wrap" aria-busy="true"><table><tbody><SkeletonRows cols={5} /></tbody></table></div>
       ) : events.length === 0 ? (
         <EmptyState title="No drift checks yet">
           Stream some traffic (<code>python simulator/stream_simulator.py</code>), then press <em>Run drift check</em> or start Automation.
@@ -45,7 +52,8 @@ export function DriftMonitor({ events }) {
               <thead>
                 <tr>
                   <th scope="col">Checked</th>
-                  <th scope="col">Window (timestep)</th>
+                  <th scope="col">Window</th>
+                  <th scope="col">Compared with</th>
                   <th scope="col" className="num">Score</th>
                   <th scope="col">Result</th>
                 </tr>
@@ -57,7 +65,10 @@ export function DriftMonitor({ events }) {
                     <Fragment key={e.id}>
                       <tr>
                         <td><RelativeTime ts={e.checked_at} /></td>
-                        <td className="mono">{e.window_start_timestep ?? "—"}–{e.window_end_timestep ?? "—"}</td>
+                        <td className="mono" title="The newest requests the check looked at">{windowLabel(e)}</td>
+                        <td className="mono" title="Drift is measured against the data this model version was trained on">
+                          {e.reference_version ? `${e.reference_version}'s data` : "—"}
+                        </td>
                         <td className="num mono">{formatScore(e.drift_score)}</td>
                         <td>
                           <Badge tone={e.triggered ? "danger" : "success"}>{e.triggered ? "Drift detected" : "No drift"}</Badge>
@@ -73,7 +84,7 @@ export function DriftMonitor({ events }) {
                       </tr>
                       {open && e.details && (
                         <tr className="detail-row" id={`drift-detail-${e.id}`}>
-                          <td colSpan={4}>
+                          <td colSpan={5}>
                             <div className="feature-grid">
                               {Object.entries(e.details).map(([name, f]) => (
                                 <div key={name} className={`feature ${f.drifted ? "drifted" : ""}`}>

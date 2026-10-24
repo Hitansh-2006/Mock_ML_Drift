@@ -310,7 +310,8 @@ def test_cycle_does_not_retrain_while_a_challenger_is_already_in_shadow(cyc):
 
 
 def _log_pairs(n, challenger_better=True):
-    """n paired production(v1)/shadow(v2) rows with labels: the challenger errs by 5-10k, production by 20k."""
+    """n paired production(v1)/shadow(v2) rows with labels: the challenger errs by 5-10k, production by 20k.
+    Pairs share a request_id and carry NO timestep, like real traffic."""
     from serving.db import SessionLocal, PredictionLog
     db = SessionLocal()
     try:
@@ -318,7 +319,7 @@ def _log_pairs(n, challenger_better=True):
             true = 300_000.0
             shadow_err = 5_000.0 + 100.0 * t if challenger_better else 30_000.0 + 100.0 * t
             for version, is_shadow, err in (("v1", False, 20_000.0), ("v2", True, shadow_err)):
-                db.add(PredictionLog(timestep=t, features={}, prediction=true + err, model_version=version,
+                db.add(PredictionLog(request_id=f"req-{t}", features={}, prediction=true + err, model_version=version,
                                      is_shadow=is_shadow, true_label=true, latency_ms=5.0))
         db.commit()
     finally:
