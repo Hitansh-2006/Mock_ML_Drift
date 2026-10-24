@@ -349,6 +349,9 @@ tbody tr.detail-row td, tbody tr.detail-row:hover td { background: var(--surface
 .kpi { display: flex; flex-direction: column; gap: var(--sp-1); }
 .kpi-value { font-family: var(--font-mono); font-size: var(--fs-2xl); font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; font-variant-numeric: tabular-nums; }
 .kpi-sub { color: var(--text-muted); font-size: var(--fs-sm); }
+.kpi-value[data-tone="success"] { color: var(--success); }
+.kpi-value[data-tone="warning"] { color: var(--warning); }
+.kpi-value[data-tone="danger"] { color: var(--danger); }
 .kpi-note { color: var(--text-muted); font-size: var(--fs-md); font-family: var(--font-sans); font-weight: 500; }
 
 /* --- Actions ------------------------------------- */
@@ -391,6 +394,7 @@ tbody tr.detail-row td, tbody tr.detail-row:hover td { background: var(--surface
 .metric-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); font-weight: 600; }
 .metric-value { font-family: var(--font-mono); font-size: var(--fs-lg); font-weight: 600; margin-top: 2px; }
 .metric-value.good { color: var(--success); }
+.metric-value.metric-small { font-size: var(--fs-md); }
 .compare { display: flex; flex-direction: column; gap: var(--sp-2); }
 .compare-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) 90px; align-items: center; gap: var(--sp-3); font-size: var(--fs-sm); }
 .compare-track { height: 12px; border-radius: 6px; background: var(--neutral-bg); overflow: hidden; }

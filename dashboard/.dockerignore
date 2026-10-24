@@ -1,0 +1,10 @@
+# Build context for the dashboard image: the build installs its own dependencies.
+node_modules
+dist
+.vite
+npm-debug.log*
+
+# Never bake local configuration into the image
+.env
+.env.*
+!.env.example

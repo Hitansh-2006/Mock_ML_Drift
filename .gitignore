@@ -56,3 +56,6 @@ node_modules/
 proj/**/models/*_v[2-9]*
 proj/**/models/*_v[1-9][0-9]*
 proj/**/npm-ci.*
+
+# Per-version drift reference snapshots (v1's is regenerated from data/training_data.csv on demand)
+models/reference_*.parquet

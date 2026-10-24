@@ -33,7 +33,8 @@ function ConfirmBody({ confirm }) {
             <dt>Challenger {r.challenger_version} error (MAE)</dt><dd>{formatMoney(r.challenger_mae)}</dd>
             <dt>Error reduction</dt><dd>{formatPercent(improvement(r.production_mae, r.challenger_mae))}</dd>
             <dt>Paired samples</dt><dd>{formatInt(r.n_labels_compared)}</dd>
-            <dt>Inference latency (prod / challenger)</dt><dd>{formatMs(r.production_latency_ms)} / {formatMs(r.challenger_latency_ms)}</dd>
+            <dt>Inference p50 (prod / challenger)</dt><dd>{formatMs(r.production_latency_ms)} / {formatMs(r.challenger_latency_ms)}</dd>
+            <dt>Inference p95 (prod / challenger)</dt><dd>{formatMs(r.production_latency_p95_ms)} / {formatMs(r.challenger_latency_p95_ms)}</dd>
           </dl>
         </>
       );

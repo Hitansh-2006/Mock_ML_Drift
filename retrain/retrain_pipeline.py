@@ -33,6 +33,7 @@ from serving.db import SessionLocal, PredictionLog
 from serving.security import admin_headers
 from data.house_price_preprocessor import HousePricePreprocessor, TARGET_COL
 from models.train_baseline import FINAL_GB_PARAMS
+from monitor.reference import save_reference
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 API_URL = os.environ.get("SERVING_API_URL", "http://localhost:8000")
@@ -146,6 +147,9 @@ def train_challenger(df, version_name):
     preproc_path = MODELS_DIR / f"preprocessor_{version_name}.joblib"
     joblib.dump(model, model_path)
     preprocessor.save(preproc_path)
+    # The drift monitor compares live traffic with the data THIS model was fitted on, so once
+    # this challenger is promoted the regime it learned stops counting as drift (BUG-2).
+    save_reference(X_train_raw, version_name, MODELS_DIR)
     meta_path.write_text(json.dumps(metrics, indent=2))
     return model_path, metrics
 

@@ -24,6 +24,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 
 from data.house_price_preprocessor import HousePricePreprocessor, TARGET_COL
+from monitor.reference import save_reference
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MODELS_DIR = Path(__file__).resolve().parent
@@ -79,7 +80,9 @@ def train(version_name="v1", data_path=None):
 
     joblib.dump(model, model_path)
     preprocessor.save(preproc_path)
-    meta_path.write_text(json.dumps(metrics, indent=2))
+    # The drift monitor compares live traffic with the data THIS model was fitted on.
+    save_reference(X_train_raw, version_name, MODELS_DIR)
+    meta_path.write_text(json.dumps(metrics, indent=2))   # written last: its presence means "fully saved"
 
     print(f"Saved {model_path.name} + {preproc_path.name}")
     print(f"Log RMSE={metrics['log_rmse']:.4f} | RMSE=${metrics['rmse']:,.0f} | MAE=${metrics['mae']:,.0f}")

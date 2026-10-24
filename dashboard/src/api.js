@@ -76,7 +76,7 @@ export const api = {
   getDriftEvents: (limit = 20) => get(`/admin/drift_events?limit=${limit}`),
   getPromotionRequests: () => get("/admin/promotion_requests"),
   decidePromotion: (promotion_request_id, decision) =>
-    post("/admin/promote", { promotion_request_id, decision, decided_by: "dashboard" }),
+    post("/admin/promote", { promotion_request_id, decision }), // the server records who is signed in
 
   // KPI stats and action buttons
   getStats: () => get("/admin/stats"),

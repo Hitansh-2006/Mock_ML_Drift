@@ -200,6 +200,45 @@ def test_guest_sessions_are_shorter_than_user_sessions(acct):
     assert guest["expires_at"] < user["expires_at"]
 
 
+# ---------------------------------------------------------------- audit trail: who decided
+def _decision_row(w, headers, request_id):
+    rows = w.client.get("/admin/promotion_requests", headers=headers).json()
+    return next(r for r in rows if r["id"] == request_id)
+
+
+def test_the_approver_comes_from_the_session_not_from_the_request(acct):
+    headers = _bearer(acct)                                     # alice
+    acct.client.post("/admin/set_shadow", headers=headers, json={"version": "v2"})
+    req = add_promotion_request("v2")
+    r = acct.client.post("/admin/promote", headers=headers, json={
+        "promotion_request_id": req, "decision": "approve", "decided_by": "mallory"})   # a client can't pick the name
+    assert r.status_code == 200
+    row = _decision_row(acct, headers, req)
+    assert (row["status"], row["decided_by"]) == ("approved", "alice")
+    assert row["decided_at"] is not None
+
+
+def test_a_rejection_records_who_rejected_it(acct):
+    headers = _bearer(acct)
+    acct.client.post("/admin/set_shadow", headers=headers, json={"version": "v2"})
+    req = add_promotion_request("v2")
+    acct.client.post("/admin/promote", headers=headers, json={"promotion_request_id": req, "decision": "reject"})
+    assert _decision_row(acct, headers, req)["decided_by"] == "alice"
+
+
+def test_a_decision_made_with_the_machine_key_is_recorded_as_such(acct):
+    acct.client.post("/admin/set_shadow", headers=H, json={"version": "v2"})
+    req = add_promotion_request("v2")
+    acct.client.post("/admin/promote", headers=H, json={"promotion_request_id": req, "decision": "approve", "decided_by": "mallory"})
+    assert _decision_row(acct, H, req)["decided_by"] == "api-key"
+
+
+def test_pending_requests_show_no_decider_yet(acct):
+    req = add_promotion_request("v2")
+    row = _decision_row(acct, _bearer(acct), req)
+    assert row["decided_by"] is None and row["decided_at"] is None
+
+
 # ---------------------------------------------------------------- config + fail-closed
 def test_auth_config_is_public_and_says_whether_login_is_possible(acct):
     cfg = acct.client.get("/auth/config").json()

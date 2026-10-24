@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from automation.controller import AutomationController, MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS
 from automation.loop import CycleDeps
-from serving import auth, registry
+from serving import auth, metrics, registry
 from serving.db import init_db, get_session, SessionLocal, PredictionLog, PromotionRequest, DriftEvent
 from data.house_price_preprocessor import HousePricePreprocessor
 from serving.security import require_admin, auth_mode, current_principal, guest_enabled, is_configured
@@ -107,8 +107,30 @@ def load_model(version: str):
         STATE["models"][version] = {
             "model": joblib.load(model_path),
             "preprocessor": HousePricePreprocessor.load(preproc_path),
+            "calls": 0,  # requests scored since it was loaded; the first few are warm-up (see _score)
         }
     return STATE["models"][version]
+
+
+# The first requests after a model is loaded are slower (lazy initialisation, cold caches). They are
+# scored normally but record NO latency, so they can't skew the p50/p95 numbers (BUG-8).
+WARMUP_CALLS = int(os.environ.get("LATENCY_WARMUP_CALLS", "3"))
+
+
+def _score(entry, features):
+    """
+    Predict with an ALREADY LOADED model. Returns (dollar prediction, inference latency in ms),
+    with None for the latency while the model is still warming up. The timer covers
+    preprocessing + inference only: never the disk load, never HTTP.
+    """
+    t0 = time.perf_counter()
+    X = entry["preprocessor"].transform_single(features)
+    pred_log = entry["model"].predict(X)[0]
+    latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    entry["calls"] += 1
+    warming_up = entry["calls"] <= WARMUP_CALLS
+    # the model predicts log1p(SalePrice); invert for a real dollar figure
+    return float(np.expm1(pred_log)), (None if warming_up else latency_ms)
 
 
 class TransitionError(Exception):
@@ -195,7 +217,8 @@ class PredictResponse(BaseModel):
     prediction: float
     model_version: str
     log_id: int
-    latency_ms: Optional[float] = None
+    latency_ms: Optional[float] = None  # inference time only (no HTTP, no disk load); null while warming up
+    request_id: Optional[str] = None    # ties this response to its shadow twin and to its label
 
 
 class LabelRequest(BaseModel):
@@ -215,14 +238,12 @@ def predict(req: PredictRequest, db: Session = Depends(get_session)):
                  "(dashboard: Train Baseline, or `python -m models.train_baseline`)."
         )
 
-    t0 = time.perf_counter()
-    X = prod["preprocessor"].transform_single(req.features)
-    pred_log = prod["model"].predict(X)[0]
-    pred = float(np.expm1(pred_log))  # model predicts log1p(SalePrice); invert for a real dollar figure
-    prod_latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    request_id = uuid.uuid4().hex  # shared by the production row and its shadow twin: this is the pairing key
+    pred, prod_latency_ms = _score(prod, req.features)
 
     log = PredictionLog(
         timestep=req.timestep,
+        request_id=request_id,
         features=req.features,
         prediction=pred,
         model_version=prod_version,
@@ -238,14 +259,12 @@ def predict(req: PredictRequest, db: Session = Depends(get_session)):
     shadow_version = STATE["shadow_version"]  # read once: it can change mid-request
     if shadow_version:
         try:
-            t_shadow_0 = time.perf_counter()
-            shadow = load_model(shadow_version)
-            shadow_X = shadow["preprocessor"].transform_single(req.features)
-            shadow_pred = float(np.expm1(shadow["model"].predict(shadow_X)[0]))
-            shadow_latency_ms = round((time.perf_counter() - t_shadow_0) * 1000.0, 2)
+            shadow = load_model(shadow_version)  # load FIRST: a cold disk read must not count as inference time
+            shadow_pred, shadow_latency_ms = _score(shadow, req.features)
 
             shadow_log = PredictionLog(
                 timestep=req.timestep,
+                request_id=request_id,
                 features=req.features,
                 prediction=shadow_pred,
                 model_version=shadow_version,
@@ -264,6 +283,7 @@ def predict(req: PredictRequest, db: Session = Depends(get_session)):
         model_version=prod_version,
         log_id=log.id,
         latency_ms=prod_latency_ms,
+        request_id=request_id,
     )
 
 
@@ -272,25 +292,23 @@ def submit_label(req: LabelRequest, db: Session = Depends(get_session)):
     """
     Attaches a true label to a previously-logged prediction, once it's
     known (this is the delayed-label problem — e.g. actual delivery time
-    is only known after the delivery happens). Also back-fills the
-    matching shadow prediction for the same timestep, if one exists.
+    is only known after the delivery happens). Also back-fills the shadow
+    prediction(s) made for the SAME request: they are found by request_id, which
+    is unique per /predict call, so a label can never leak onto another request
+    or another shadow version (the old timestep match could, and real traffic
+    has no timesteps at all). Legacy rows without a request_id get no back-fill.
     """
     log = db.query(PredictionLog).filter(PredictionLog.id == req.log_id).first()
     if not log:
         raise HTTPException(404, "log_id not found")
     log.true_label = req.true_label
 
-    if log.timestep is not None and not log.is_shadow:
-        shadow_log = (
+    if log.request_id and not log.is_shadow:
+        (
             db.query(PredictionLog)
-            .filter(
-                PredictionLog.timestep == log.timestep,
-                PredictionLog.is_shadow == True,  # noqa: E712
-            )
-            .first()
+            .filter(PredictionLog.request_id == log.request_id, PredictionLog.is_shadow == True)  # noqa: E712
+            .update({"true_label": req.true_label}, synchronize_session=False)
         )
-        if shadow_log:
-            shadow_log.true_label = req.true_label
 
     db.commit()
     return {"status": "ok", "log_id": req.log_id}
@@ -388,6 +406,7 @@ def list_predictions(limit: int = 50, db: Session = Depends(get_session)):
     return [
         {
             "id": r.id,
+            "request_id": r.request_id,
             "timestep": r.timestep,
             "model_version": r.model_version,
             "is_shadow": r.is_shadow,
@@ -410,6 +429,9 @@ def list_drift_events(limit: int = 20, db: Session = Depends(get_session)):
             "checked_at": r.checked_at,
             "window_start_timestep": r.window_start_timestep,
             "window_end_timestep": r.window_end_timestep,
+            "window_start_log_id": r.window_start_log_id,
+            "window_end_log_id": r.window_end_log_id,
+            "reference_version": r.reference_version,
             "drift_score": r.drift_score,
             "method": r.method,
             "threshold": r.threshold,
@@ -442,7 +464,7 @@ def set_shadow(req: SetShadowRequest, db: Session = Depends(get_session)):
 class PromotionDecisionRequest(BaseModel):
     promotion_request_id: int
     decision: str  # "approve" or "reject" — nothing else is accepted
-    decided_by: Optional[str] = None
+    decided_by: Optional[str] = None  # ignored: the server records the signed-in user instead
 
 
 @admin.get("/promotion_requests")
@@ -456,11 +478,15 @@ def list_promotion_requests(db: Session = Depends(get_session)):
             "production_version_at_request": r.production_version_at_request,
             "challenger_mae": r.challenger_mae,
             "production_mae": r.production_mae,
-            "challenger_latency_ms": r.challenger_latency_ms,
+            "challenger_latency_ms": r.challenger_latency_ms,        # inference p50
             "production_latency_ms": r.production_latency_ms,
+            "challenger_latency_p95_ms": r.challenger_latency_p95_ms,
+            "production_latency_p95_ms": r.production_latency_p95_ms,
             "n_labels_compared": r.n_labels_compared,
             "status": r.status,
             "created_at": r.created_at,
+            "decided_at": r.decided_at,
+            "decided_by": r.decided_by,
             "explanation": r.explanation,
         }
         for r in rows
@@ -468,7 +494,8 @@ def list_promotion_requests(db: Session = Depends(get_session)):
 
 
 @admin.post("/promote")
-def decide_promotion(req: PromotionDecisionRequest, db: Session = Depends(get_session)):
+def decide_promotion(req: PromotionDecisionRequest, db: Session = Depends(get_session),
+                     principal: auth.Principal = Depends(require_admin)):
     """
     THE ONLY code path in this entire system that can change which model
     serves production traffic. Requires an explicit human decision on an
@@ -479,6 +506,9 @@ def decide_promotion(req: PromotionDecisionRequest, db: Session = Depends(get_se
     if req.decision not in ("approve", "reject"):
         raise HTTPException(400, "decision must be 'approve' or 'reject'")
 
+    # The audit trail names the authenticated caller. `req.decided_by` is accepted for old
+    # clients but ignored: a client must not be able to choose who is recorded as the approver.
+    decided_by = principal.username
     with REGISTRY_LOCK:
         promo = db.query(PromotionRequest).filter(PromotionRequest.id == req.promotion_request_id).first()
         if not promo:
@@ -492,9 +522,9 @@ def decide_promotion(req: PromotionDecisionRequest, db: Session = Depends(get_se
                 # leave the request pending and production untouched (BUG-7).
                 registry.assert_promotable(db, promo)
                 _load_or_raise(promo.challenger_version)
-                registry.promote(db, promo, req.decided_by)
+                registry.promote(db, promo, decided_by)
             else:
-                registry.reject(db, promo, req.decided_by)
+                registry.reject(db, promo, decided_by)
         except registry.RegistryError as e:
             raise HTTPException(e.status_code, e.detail)
         except TransitionError as e:
@@ -524,30 +554,28 @@ def get_stats(db: Session = Depends(get_session)):
         PredictionLog.is_shadow == True  # noqa: E712
     ).count()
 
+    # Everything below describes the model in production NOW. Mixing in rows served by its
+    # predecessors would average two different models into one meaningless number (BUG-9).
+    production_version = STATE["production_version"]
+    served_by_production = [
+        PredictionLog.is_shadow == False,  # noqa: E712
+        PredictionLog.model_version == production_version,
+    ]
     recent_labeled = (
         db.query(PredictionLog)
-        .filter(
-            PredictionLog.is_shadow == False,  # noqa: E712
-            PredictionLog.true_label.isnot(None),
-        )
+        .filter(*served_by_production, PredictionLog.true_label.isnot(None))
         .order_by(PredictionLog.id.desc())
         .limit(200)
         .all()
     )
     recent_prod = (
         db.query(PredictionLog)
-        .filter(
-            PredictionLog.is_shadow == False,  # noqa: E712
-        )
+        .filter(*served_by_production)
         .order_by(PredictionLog.id.desc())
         .limit(100)
         .all()
     )
-    production_latency_ms = None
-    if recent_prod:
-        lats = [r.latency_ms for r in recent_prod if r.latency_ms is not None]
-        if lats:
-            production_latency_ms = round(sum(lats) / len(lats), 1)
+    latency_p50, latency_p95 = metrics.latency_percentiles([r.latency_ms for r in recent_prod])
 
     production_mae = None
     if recent_labeled:
@@ -557,8 +585,16 @@ def get_stats(db: Session = Depends(get_session)):
     return {
         "total_predictions": total_predictions,
         "total_labeled": total_labeled,
-        "production_mae": production_mae,
-        "production_latency_ms": production_latency_ms,
+        "production_version": production_version,
+        "production_mae": production_mae,                 # null until this version has labelled rows
+        "production_mae_n": len(recent_labeled),
+        # How to read the MAE without house-price constants: relative to what this model scored on
+        # its own validation split, with the warn/alert ratios coming from config.
+        "expected_mae": registry.describe(MODELS_DIR, production_version).get("metrics", {}).get("mae"),
+        "mae_warn_ratio": metrics.ratio_setting("MAE_WARN_RATIO", 1.3),
+        "mae_alert_ratio": metrics.ratio_setting("MAE_ALERT_RATIO", 2.0),
+        "production_latency_ms": latency_p50,             # inference p50 over the last 100 requests
+        "production_latency_p95_ms": latency_p95,
         "shadow_predictions": shadow_predictions,
     }
 

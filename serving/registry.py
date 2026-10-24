@@ -31,12 +31,16 @@ class RegistryError(Exception):
 
 
 def describe(models_dir: Path, version: str) -> dict:
-    """Optional registry columns taken from model_<version>.meta.json (missing/bad file -> empty)."""
+    """Optional registry columns: model_<version>.meta.json and the drift-reference snapshot, when present."""
+    info = {}
+    reference = f"reference_{version}.parquet"
+    if (Path(models_dir) / reference).exists():
+        info["reference_path"] = reference
     try:
         meta = json.loads((Path(models_dir) / f"model_{version}.meta.json").read_text())
     except (OSError, ValueError):
-        return {}
-    return {"metrics": meta, "trained_on_rows": meta.get("n_train_rows")}
+        return info
+    return {**info, "metrics": meta, "trained_on_rows": meta.get("n_train_rows")}
 
 
 def _row(db: Session, version: str) -> Optional[ModelRegistry]:

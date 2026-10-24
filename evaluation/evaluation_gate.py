@@ -25,6 +25,7 @@ import numpy as np
 import requests
 from scipy.stats import wilcoxon
 
+from serving import metrics
 from serving.db import SessionLocal, PredictionLog, PromotionRequest
 from llm.explain import explain_promotion
 
@@ -36,9 +37,14 @@ API_URL = os.environ.get("SERVING_API_URL", "http://localhost:8000")
 def load_paired_data(production_version, shadow_version):
     """
     Pulls production-model rows and shadow-model rows that each have a true
-    label, then keeps only the timesteps present in BOTH — a true paired,
-    apples-to-apples comparison rather than comparing two separate averages
-    over possibly-different requests.
+    label, then keeps only the REQUESTS present in both (matched by request_id,
+    which /predict gives the production row and its shadow twin). That is a true
+    paired, apples-to-apples comparison on identical inputs. Timesteps play no
+    part: real traffic has none, and replayed streams repeat them. Legacy rows
+    without a request_id can't be paired and are ignored.
+
+    Returns (production_errors, shadow_errors, request_ids, production_latencies,
+    shadow_latencies); latencies are the raw per-request values (warm-up rows have none).
     """
     db = SessionLocal()
     try:
@@ -63,31 +69,37 @@ def load_paired_data(production_version, shadow_version):
     finally:
         db.close()
 
-    prod_by_ts = {r.timestep: r for r in prod_rows if r.timestep is not None}
-    shadow_by_ts = {r.timestep: r for r in shadow_rows if r.timestep is not None}
-    common_ts = sorted(set(prod_by_ts) & set(shadow_by_ts))
+    prod_by_id = {r.request_id: r for r in prod_rows if r.request_id}
+    shadow_by_id = {r.request_id: r for r in shadow_rows if r.request_id}
+    common_ids = sorted(set(prod_by_id) & set(shadow_by_id))
 
     prod_errors, shadow_errors = [], []
     prod_latencies, shadow_latencies = [], []
-    for ts in common_ts:
-        true_label = prod_by_ts[ts].true_label
-        prod_errors.append(abs(prod_by_ts[ts].prediction - true_label))
-        shadow_errors.append(abs(shadow_by_ts[ts].prediction - true_label))
-        if getattr(prod_by_ts[ts], "latency_ms", None) is not None:
-            prod_latencies.append(prod_by_ts[ts].latency_ms)
-        if getattr(shadow_by_ts[ts], "latency_ms", None) is not None:
-            shadow_latencies.append(shadow_by_ts[ts].latency_ms)
-
-    prod_lat_mean = float(np.mean(prod_latencies)) if prod_latencies else None
-    shadow_lat_mean = float(np.mean(shadow_latencies)) if shadow_latencies else None
+    for rid in common_ids:
+        true_label = prod_by_id[rid].true_label
+        prod_errors.append(abs(prod_by_id[rid].prediction - true_label))
+        shadow_errors.append(abs(shadow_by_id[rid].prediction - true_label))
+        prod_latencies.append(prod_by_id[rid].latency_ms)
+        shadow_latencies.append(shadow_by_id[rid].latency_ms)
 
     return (
         np.array(prod_errors),
         np.array(shadow_errors),
-        common_ts,
-        prod_lat_mean,
-        shadow_lat_mean,
+        common_ids,
+        prod_latencies,
+        shadow_latencies,
     )
+
+
+def _wilcoxon_p(prod_errors, shadow_errors):
+    """
+    One-sided Wilcoxon p-value for "production's errors are systematically greater than the
+    challenger's". If every paired difference is exactly zero (e.g. a challenger identical to
+    production) scipy raises instead of answering; there is no evidence of improvement, so p = 1.
+    """
+    if np.all(np.asarray(prod_errors) == np.asarray(shadow_errors)):
+        return 1.0
+    return float(wilcoxon(prod_errors, shadow_errors, alternative="greater")[1])
 
 
 def run_gate(min_samples):
@@ -133,11 +145,11 @@ def evaluate(min_samples, status=None):
     (
         prod_errors,
         shadow_errors,
-        common_ts,
-        prod_lat,
-        shadow_lat,
+        common_ids,
+        prod_latencies,
+        shadow_latencies,
     ) = load_paired_data(production_version, shadow_version)
-    n = len(common_ts)
+    n = len(common_ids)
 
     print(f"Comparing {production_version} (production) vs {shadow_version} (shadow) "
           f"on {n} paired, labeled requests...")
@@ -155,20 +167,24 @@ def evaluate(min_samples, status=None):
     prod_mae = float(np.mean(prod_errors))
     shadow_mae = float(np.mean(shadow_errors))
 
-    # alternative="greater": tests whether production's errors are
-    # systematically GREATER than the challenger's — i.e. whether the
-    # challenger is making smaller errors, consistently, not by chance.
-    stat, p_value = wilcoxon(prod_errors, shadow_errors, alternative="greater")
+    # One-sided: is production's error systematically GREATER than the challenger's,
+    # i.e. is the challenger making smaller errors consistently, not by chance?
+    p_value = _wilcoxon_p(prod_errors, shadow_errors)
 
     challenger_better = shadow_mae < prod_mae
     significant = p_value < P_VALUE_THRESHOLD
     passes_gate = challenger_better and significant
 
+    # Inference latency (never HTTP, never model loading): median and 95th percentile
+    # over the paired requests. Reported to the human; it does not decide the gate.
+    prod_lat, prod_lat_p95 = metrics.latency_percentiles(prod_latencies)
+    shadow_lat, shadow_lat_p95 = metrics.latency_percentiles(shadow_latencies)
+
     print(f"Production MAE  : {prod_mae:.2f}")
     print(f"Challenger MAE  : {shadow_mae:.2f}")
     if prod_lat is not None and shadow_lat is not None:
-        print(f"Production Latency: {prod_lat:.2f} ms")
-        print(f"Challenger Latency: {shadow_lat:.2f} ms")
+        print(f"Production inference latency : p50 {prod_lat:.2f} ms, p95 {prod_lat_p95:.2f} ms")
+        print(f"Challenger inference latency : p50 {shadow_lat:.2f} ms, p95 {shadow_lat_p95:.2f} ms")
     print(f"Wilcoxon p-value: {p_value:.6f} (significant if < {P_VALUE_THRESHOLD})")
 
     if existing_pending:
@@ -179,6 +195,8 @@ def evaluate(min_samples, status=None):
             promo.production_mae = prod_mae
             promo.challenger_latency_ms = shadow_lat
             promo.production_latency_ms = prod_lat
+            promo.challenger_latency_p95_ms = shadow_lat_p95
+            promo.production_latency_p95_ms = prod_lat_p95
             promo.n_labels_compared = n
             # if more evidence flipped the conclusion, withdraw the request rather
             # than leave a stale "pending" row asking for approval of something
@@ -227,6 +245,8 @@ def evaluate(min_samples, status=None):
                 production_mae=prod_mae,
                 challenger_latency_ms=shadow_lat,
                 production_latency_ms=prod_lat,
+                challenger_latency_p95_ms=shadow_lat_p95,
+                production_latency_p95_ms=prod_lat_p95,
                 n_labels_compared=n,
                 status="pending",
                 explanation=explanation,

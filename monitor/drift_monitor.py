@@ -27,25 +27,14 @@ import pandas as pd
 from scipy.stats import ks_2samp
 from sqlalchemy import select
 
+from monitor import reference
+from monitor.reference import MONITORED_COLUMNS  # the curated raw columns; see monitor/reference.py for why
+from serving import registry
 from serving.db import SessionLocal, PredictionLog, DriftEvent, init_db
 from llm.explain import explain_drift
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TRAINING_DATA_PATH = DATA_DIR / "training_data.csv"
-
-# Deliberately checking a curated set of meaningful RAW columns, not the
-# ~200 one-hot dummy columns the model actually trains on. A dummy column
-# is just 0s and 1s — running KS-test on it is mostly meaningless (its
-# "distribution" is just a proportion). Checking the underlying numeric/
-# ordinal columns before encoding is both more interpretable and more
-# statistically sound. This list includes the exact columns the dataset
-# generator injects drift into (OverallQual, GrLivArea, YearRemodAdd) plus
-# related columns that should stay stable, as a control.
-MONITORED_COLUMNS = [
-    "OverallQual", "GrLivArea", "YearBuilt", "YearRemodAdd",
-    "TotalBsmtSF", "GarageCars", "GarageArea", "1stFlrSF",
-    "FullBath", "TotRmsAbvGrd",
-]
 
 # A feature triggers "drifted" if its KS statistic exceeds this AND the
 # difference is statistically significant (p < 0.05, i.e. very unlikely to
@@ -55,10 +44,38 @@ P_VALUE_THRESHOLD = 0.05
 MIN_DRIFTED_FEATURES_TO_TRIGGER = 2  # out of however many monitored columns exist
 
 
-def load_reference():
-    df = pd.read_csv(TRAINING_DATA_PATH)
+def current_production_version():
+    """Which model is in production RIGHT NOW, according to the DB registry (v1 before any exists)."""
+    db = SessionLocal()
+    try:
+        return registry.current_roles(db)[0] or reference.BASELINE_VERSION
+    finally:
+        db.close()
+
+
+def resolve_reference(version):
+    """
+    The training-data snapshot to compare live traffic with: the one saved by `version`.
+    A version trained before snapshots existed has none; it then falls back to the
+    baseline's (made on demand from training_data.csv). Returns (df, feature_cols, version_used)
+    so the drift event can record whose data it really was compared against.
+    """
+    df = reference.load_reference_for(version)
+    used = version
+    if df is None:
+        df = reference.ensure_baseline_reference()
+        used = reference.BASELINE_VERSION
+        if version != used:
+            print(f"No reference snapshot for {version} (trained before snapshots existed); "
+                  f"comparing with the baseline's training data instead.")
     feature_cols = [c for c in MONITORED_COLUMNS if c in df.columns]
-    return df[feature_cols].dropna(), feature_cols
+    return df[feature_cols].dropna(), feature_cols, used
+
+
+def load_reference():
+    """Back-compat helper: the current production model's reference as (df, feature_cols)."""
+    df, feature_cols, _ = resolve_reference(current_production_version())
+    return df, feature_cols
 
 
 def load_recent_window(feature_cols, window_size):
@@ -80,13 +97,15 @@ def load_recent_window(feature_cols, window_size):
         db.close()
 
     if not rows:
-        return None, None, None
+        return None, None, None, None, None
 
     rows = list(reversed(rows))  # back to chronological order
     records = [r.features for r in rows]
     recent_df = pd.DataFrame(records)[feature_cols].apply(pd.to_numeric, errors="coerce").dropna()
-    timesteps = [r.timestep for r in rows]
-    return recent_df, min(timesteps), max(timesteps)
+    # timestep is optional metadata (real traffic has none), so the window is identified by row ids
+    timesteps = [r.timestep for r in rows if r.timestep is not None]
+    ts_range = (min(timesteps), max(timesteps)) if timesteps else (None, None)
+    return recent_df, ts_range[0], ts_range[1], rows[0].id, rows[-1].id
 
 
 def compute_drift_scores(reference_df, recent_df, feature_cols):
@@ -121,27 +140,29 @@ def compute_drift_scores(reference_df, recent_df, feature_cols):
 
 def run_once(window_size):
     init_db()
-    reference_df, feature_cols = load_reference()
-    recent_df, ts_start, ts_end = load_recent_window(feature_cols, window_size)
+    production_version = current_production_version()
+    reference_df, feature_cols, reference_version = resolve_reference(production_version)
+    recent_df, ts_start, ts_end, start_id, end_id = load_recent_window(feature_cols, window_size)
 
     if recent_df is None or len(recent_df) < window_size:
         n = 0 if recent_df is None else len(recent_df)
         print(f"Not enough logged predictions yet ({n}/{window_size}). Skipping check.")
         return None
 
-    # If the most recent window covers the exact same range as the last
-    # check, no new traffic has arrived since then — re-running the same
-    # KS-test on the same rows would just produce the same result again.
-    # Skip it rather than spamming identical rows into drift_events.
+    # If the most recent window ends at the same logged request as the last check AND was
+    # compared with the same reference, nothing new has arrived: re-running the same KS
+    # test on the same rows would only repeat the result. (Row ids, not timesteps: real
+    # traffic has no timesteps.) A different reference is NOT a repeat: right after a
+    # promotion the same rows must be judged against the new model's training data.
     db = SessionLocal()
     try:
         last_event = db.query(DriftEvent).order_by(DriftEvent.id.desc()).first()
     finally:
         db.close()
 
-    if last_event and last_event.window_end_timestep == ts_end:
-        print(f"No new predictions since the last check (still ending at "
-              f"timestep {ts_end}). Skipping — nothing new to evaluate.")
+    if last_event and last_event.window_end_log_id == end_id and last_event.reference_version == reference_version:
+        print(f"No new predictions since the last check (still ending at request #{end_id}, "
+              f"compared with {reference_version}). Skipping — nothing new to evaluate.")
         return None
 
     result = compute_drift_scores(reference_df, recent_df, feature_cols)
@@ -163,6 +184,9 @@ def run_once(window_size):
             triggered=result["triggered"],
             details=result["per_feature"],
             explanation=explanation,
+            window_start_log_id=start_id,
+            window_end_log_id=end_id,
+            reference_version=reference_version,
         )
         db.add(event)
         db.commit()
@@ -171,8 +195,9 @@ def run_once(window_size):
         db.close()
 
     status = "DRIFT DETECTED" if result["triggered"] else "no drift"
+    window = f"requests #{start_id}-#{end_id}" + (f", timesteps {ts_start}-{ts_end}" if ts_end is not None else "")
     print(
-        f"[timesteps {ts_start}-{ts_end}] {status} | "
+        f"[{window} vs {reference_version}] {status} | "
         f"score={result['overall_score']} | "
         f"{result['n_drifted_features']}/{len(feature_cols)} features flagged | "
         f"event_id={event.id}"
