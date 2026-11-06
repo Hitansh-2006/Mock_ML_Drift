@@ -14,10 +14,12 @@ const CheckIcon = () => <svg {...icon} width="16" height="16"><path d="M5 12.5l4
 
 function Logo({ size = 28 }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M12 3l8 3v6c0 4.5-3.2 7.8-8 9-4.8-1.2-8-4.5-8-9V6l8-3z" />
-      <path d="M8 12h2.5l1.5-3 2 6 1.5-3H17" />
-    </svg>
+    <img
+      src="/logo.jpg"
+      alt="ML Drift Watchdog Logo"
+      className="brand-logo"
+      style={{ height: size, width: "auto", objectFit: "contain", borderRadius: "6px" }}
+    />
   );
 }
 
@@ -77,15 +79,18 @@ function explain(e) {
 
 export function LoginPage({ auth, theme, setTheme }) {
   const [cfg, setCfg] = useState({ state: "loading" }); // loading | ready | offline
+  const [mode, setMode] = useState("signin"); // signin | signup
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [reveal, setReveal] = useState(false);
   const [caps, setCaps] = useState(false);
-  const [busy, setBusy] = useState(null); // signin | guest
+  const [busy, setBusy] = useState(null); // signin | signup | guest
   const [error, setError] = useState(null);
   const [attempt, setAttempt] = useState(0); // re-keys the error so its shake replays
   const userRef = useRef(null);
   const passRef = useRef(null);
+  const confirmPassRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -107,6 +112,15 @@ export function LoginPage({ auth, theme, setTheme }) {
       .catch(() => setCfg({ state: "offline" }));
   };
 
+  const switchMode = (newMode) => {
+    setMode(newMode);
+    setError(null);
+    setPassword("");
+    setConfirmPassword("");
+    setAttempt((n) => n + 1);
+    focusAfter.current = userRef;
+  };
+
   // Focus can only move once the inputs are enabled again, i.e. after the next render.
   const focusAfter = useRef(null);
   useEffect(() => {
@@ -124,16 +138,43 @@ export function LoginPage({ auth, theme, setTheme }) {
   const submit = async (event) => {
     event.preventDefault();
     if (busy) return;
-    if (!username.trim() || !password) {
+    const cleanUser = username.trim();
+    if (!cleanUser || !password) {
       setError("Enter your username and password.");
-      focusAfter.current = username.trim() ? passRef : userRef;
+      focusAfter.current = cleanUser ? passRef : userRef;
       setAttempt((n) => n + 1);
       return;
     }
+
+    if (mode === "signup") {
+      if (password.length < 8) {
+        setError("Password must be at least 8 characters.");
+        focusAfter.current = passRef;
+        setAttempt((n) => n + 1);
+        return;
+      }
+      if (password !== confirmPassword) {
+        setError("Passwords do not match.");
+        focusAfter.current = confirmPassRef;
+        setAttempt((n) => n + 1);
+        return;
+      }
+      setBusy("signup");
+      setError(null);
+      try {
+        await auth.signup(cleanUser, password);
+      } catch (e) {
+        setPassword("");
+        setConfirmPassword("");
+        fail(e, passRef);
+      }
+      return;
+    }
+
     setBusy("signin");
     setError(null);
     try {
-      await auth.login(username.trim(), password);
+      await auth.login(cleanUser, password);
     } catch (e) {
       setPassword("");
       fail(e, passRef);
@@ -152,14 +193,14 @@ export function LoginPage({ auth, theme, setTheme }) {
   };
 
   const notConfigured = cfg.state === "ready" && !cfg.configured;
-  const formDisabled = cfg.state !== "ready" || notConfigured;
+  const formDisabled = cfg.state !== "ready" || (mode === "signin" && notConfigured);
   const checkCaps = (e) => setCaps(e.getModifierState?.("CapsLock") ?? false);
 
   return (
     <div className="auth-shell">
       <aside className="auth-hero">
         <div className="hero-glow" aria-hidden="true" />
-        <div className="hero-brand rise" style={{ "--d": "0.05s" }}><Logo size={30} /><span>Drift-Watchdog</span></div>
+        <div className="hero-brand rise" style={{ "--d": "0.05s" }}><Logo size={36} /><span>ML Drift Watchdog</span></div>
 
         <div className="hero-body">
           <p className="hero-title rise" style={{ "--d": "0.15s" }}>Know when your model's world changes.</p>
@@ -185,9 +226,11 @@ export function LoginPage({ auth, theme, setTheme }) {
         </div>
 
         <div className="auth-card rise" style={{ "--d": "0.1s" }}>
-          <div className="auth-mark" aria-hidden="true"><Logo size={26} /></div>
-          <h1>Sign in</h1>
-          <p className="auth-sub">to the Drift-Watchdog console</p>
+          <div className="auth-mark" aria-hidden="true"><Logo size={46} /></div>
+          <h1>{mode === "signin" ? "Sign in" : "Create account"}</h1>
+          <p className="auth-sub">
+            {mode === "signin" ? "to the ML Drift Watchdog console" : "to get admin access to the ML Drift Watchdog console"}
+          </p>
 
           {auth.notice && <div className="auth-alert" data-tone="info" role="status">{auth.notice}</div>}
           {cfg.state === "offline" && (
@@ -196,9 +239,9 @@ export function LoginPage({ auth, theme, setTheme }) {
               <button type="button" className="link-btn" onClick={retry}>Try again</button>
             </div>
           )}
-          {notConfigured && (
+          {notConfigured && mode === "signin" && (
             <div className="auth-alert" data-tone="warning" role="alert">
-              No account exists yet. Set <code>ADMIN_USERNAME</code> and <code>ADMIN_PASSWORD</code> in <code>.env</code> and restart the API.
+              <span>No account exists yet. Create an account with Sign up or set <code>ADMIN_USERNAME</code> in <code>.env</code>.</span>
             </div>
           )}
 
@@ -216,11 +259,14 @@ export function LoginPage({ auth, theme, setTheme }) {
             </div>
 
             <div className="field-block">
-              <label htmlFor="login-password">Password</label>
+              <label htmlFor="login-password">
+                Password {mode === "signup" && <span className="label-sub">(min 8 characters)</span>}
+              </label>
               <div className="input-wrap">
                 <span className="input-icon"><LockIcon /></span>
                 <input
-                  id="login-password" ref={passRef} type={reveal ? "text" : "password"} autoComplete="current-password"
+                  id="login-password" ref={passRef} type={reveal ? "text" : "password"}
+                  autoComplete={mode === "signup" ? "new-password" : "current-password"}
                   value={password} onChange={(e) => setPassword(e.target.value)} onKeyUp={checkCaps} onKeyDown={checkCaps} onBlur={() => setCaps(false)}
                   disabled={formDisabled || !!busy} aria-invalid={error ? true : undefined}
                 />
@@ -235,17 +281,57 @@ export function LoginPage({ auth, theme, setTheme }) {
               {caps && <p className="caps-hint" role="status">Caps Lock is on</p>}
             </div>
 
+            {mode === "signup" && (
+              <div className="field-block">
+                <label htmlFor="signup-confirm-password">Confirm password</label>
+                <div className="input-wrap">
+                  <span className="input-icon"><LockIcon /></span>
+                  <input
+                    id="signup-confirm-password" ref={confirmPassRef} type={reveal ? "text" : "password"} autoComplete="new-password"
+                    value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} onKeyUp={checkCaps} onKeyDown={checkCaps} onBlur={() => setCaps(false)}
+                    disabled={formDisabled || !!busy} aria-invalid={error ? true : undefined}
+                  />
+                </div>
+              </div>
+            )}
+
             {error && <div key={attempt} id="auth-error" className="auth-error" role="alert">{error}</div>}
 
             <button type="submit" className="btn btn-primary auth-submit" disabled={formDisabled || !!busy}>
-              {busy === "signin" ? <><Spinner /> Signing in…</> : "Sign in"}
+              {busy === "signin" ? (
+                <><Spinner /> Signing in…</>
+              ) : busy === "signup" ? (
+                <><Spinner /> Creating account…</>
+              ) : mode === "signin" ? (
+                "Sign in"
+              ) : (
+                "Create account"
+              )}
             </button>
+
+            <div className="auth-switch">
+              {mode === "signin" ? (
+                <>
+                  <span>Don't have an account or forgot credentials?</span>
+                  <button type="button" className="link-btn" onClick={() => switchMode("signup")} disabled={!!busy}>
+                    Sign up
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span>Already have an account?</span>
+                  <button type="button" className="link-btn" onClick={() => switchMode("signin")} disabled={!!busy}>
+                    Sign in
+                  </button>
+                </>
+              )}
+            </div>
           </form>
 
-          {cfg.state === "ready" && cfg.guest_enabled && !notConfigured && (
+          {cfg.state === "ready" && cfg.guest_enabled && (
             <>
               <div className="auth-divider"><span>or</span></div>
-              <Button className="auth-guest" loading={busy === "guest"} loadingLabel="Opening guest view…" disabledReason={busy === "signin" ? "Signing in…" : undefined} onClick={continueAsGuest}>
+              <Button className="auth-guest" loading={busy === "guest"} loadingLabel="Opening guest view…" disabledReason={busy ? "Please wait…" : undefined} onClick={continueAsGuest}>
                 <GuestIcon /> Continue as guest
               </Button>
               <p className="auth-hint">Look around in read-only mode. No account needed, and nothing can be changed.</p>

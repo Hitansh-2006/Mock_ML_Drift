@@ -340,6 +340,12 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=512)
 
 
+class SignupRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=512)
+    role: Optional[str] = "admin"
+
+
 def _require_configured(db: Session):
     if not is_configured(db):
         raise HTTPException(503, "Sign-in is not set up: no account exists. "
@@ -349,7 +355,24 @@ def _require_configured(db: Session):
 @auth_router.get("/config")
 def auth_config(db: Session = Depends(get_session)):
     """What the login page needs to know before anyone has signed in."""
-    return {"configured": is_configured(db), "guest_enabled": guest_enabled()}
+    return {"configured": is_configured(db), "guest_enabled": guest_enabled(), "signup_enabled": True}
+
+
+@auth_router.post("/signup")
+def signup(req: SignupRequest, request: Request, db: Session = Depends(get_session)):
+    client = request.client.host if request.client else "unknown"
+    wait = auth.retry_after(req.username, client)
+    if wait:
+        raise HTTPException(429, f"Too many failed attempts. Try again in {wait} seconds.",
+                            headers={"Retry-After": str(wait)})
+    role = req.role if req.role in auth.ROLES else "admin"
+    try:
+        user = auth.create_user(db, req.username, req.password, role)
+    except ValueError as e:
+        auth.record_failure(req.username, client)
+        raise HTTPException(400, str(e))
+    auth.record_success(req.username, client)
+    return auth.create_session(db, user.username, user.role)
 
 
 @auth_router.post("/login")

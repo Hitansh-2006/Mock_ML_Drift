@@ -310,3 +310,32 @@ def test_a_weak_or_placeholder_seed_password_is_refused_not_stored(world, monkey
         assert db.query(User).count() == 0
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------- signup
+def test_signup_creates_admin_session_and_persists_user(acct):
+    r = acct.client.post("/auth/signup", json={"username": "bob", "password": "supersecretpassword"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["user"]["username"] == "bob"
+    assert body["user"]["role"] == "admin"
+    assert body["user"]["guest"] is False
+    assert body["token"]
+
+    # Bob can authenticate and access admin routes
+    me = acct.client.get("/auth/me", headers={"Authorization": f"Bearer {body['token']}"})
+    assert me.status_code == 200
+    assert me.json()["username"] == "bob"
+    assert me.json()["role"] == "admin"
+
+
+def test_signup_rejects_duplicate_username(acct):
+    r = acct.client.post("/auth/signup", json={"username": "alice", "password": "supersecretpassword"})
+    assert r.status_code == 400
+    assert "already exists" in r.json()["detail"]
+
+
+def test_signup_rejects_short_password(acct):
+    r = acct.client.post("/auth/signup", json={"username": "carol", "password": "123"})
+    assert r.status_code == 400
+    assert "at least 8 characters" in r.json()["detail"]
