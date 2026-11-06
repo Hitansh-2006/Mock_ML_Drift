@@ -66,6 +66,7 @@ export const api = {
   // sign-in
   authConfig: () => get("/auth/config"),
   login: (username, password) => post("/auth/login", { username, password }),
+  signup: (username, password, role = "admin") => post("/auth/signup", { username, password, role }),
   guest: () => postEmpty("/auth/guest"),
   me: () => get("/auth/me"),
   logout: () => postEmpty("/auth/logout"),

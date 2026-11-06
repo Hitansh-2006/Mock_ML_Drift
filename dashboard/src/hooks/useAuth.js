@@ -41,6 +41,10 @@ export function useAuth() {
 
   /** Throws on failure so the login form can show the server's message. */
   const login = useCallback(async (username, password) => adopt(await api.login(username, password)), [adopt]);
+  const signup = useCallback(
+    async (username, password, role = "admin") => adopt(await api.signup(username, password, role)),
+    [adopt]
+  );
   const guest = useCallback(async () => adopt(await api.guest()), [adopt]);
 
   const signOut = useCallback(async (notice = null) => {
@@ -53,5 +57,5 @@ export function useAuth() {
     setState({ status: "anon", user: null, notice });
   }, []);
 
-  return { ...state, login, guest, signOut };
+  return { ...state, login, signup, guest, signOut };
 }

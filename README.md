@@ -225,6 +225,27 @@ The headless scripts (`python -m retrain.retrain_pipeline`, `python -m automatio
 talk to the API without a login, so they need the optional machine key: set the same
 `ADMIN_API_KEY` in `.env`.
 
+### Model Context Protocol (MCP) Server for AI Tools
+Drift-Watchdog includes an MCP server (`mcp_server.py`) allowing AI assistants (Claude Desktop, Cursor, Antigravity) to monitor and control the pipeline.
+
+Run the MCP server directly:
+```bash
+python mcp_server.py
+```
+
+To connect it in Claude Desktop or Cursor, add this to your `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "drift-watchdog": {
+      "command": "python",
+      "args": ["-m", "mcp_server"],
+      "cwd": "/path/to/drift-watchdog"
+    }
+  }
+}
+```
+
 ### With Postgres + full automation, via Docker Compose
 ```bash
 cp .env.example .env        # then set ADMIN_PASSWORD (and optionally GROQ_API_KEY)
